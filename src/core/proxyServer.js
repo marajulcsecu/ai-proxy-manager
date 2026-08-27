@@ -68,13 +68,10 @@ export function startProxyServer() {
     const headers = { ...clientReq.headers, ...SPOOFED_HEADERS, host: targetHost };
 
     if (actualKey) {
-      if (clientReq.url.includes('/messages')) {
-        headers['x-api-key'] = actualKey;
-        delete headers['authorization'];
-      } else {
-        headers['authorization'] = `Bearer ${actualKey}`;
-        delete headers['x-api-key'];
-      }
+      // Tabitoken and GoRouter require the 'Authorization: Bearer' header,
+      // while official Anthropic SDKs expect 'x-api-key'. We supply both to be safe across all providers!
+      headers['x-api-key'] = actualKey;
+      headers['authorization'] = `Bearer ${actualKey}`;
     }
 
     const options = {
