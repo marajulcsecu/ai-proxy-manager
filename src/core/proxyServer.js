@@ -57,7 +57,7 @@ export function startProxyServer() {
     }
 
     // 3. Resolve API Key (Use client key if valid, otherwise use database key)
-    const actualKey = (token && token !== 'dummy' && !token.includes('dummy-token') && token.length > 20) 
+    const actualKey = (token && !token.includes('dummy') && token.length > 15) 
       ? token 
       : provider.apiKey;
 
@@ -71,7 +71,7 @@ export function startProxyServer() {
       // Tabitoken and GoRouter require the 'Authorization: Bearer' header,
       // while official Anthropic SDKs expect 'x-api-key'. We supply both to be safe across all providers!
       headers['x-api-key'] = actualKey;
-      headers['authorization'] = `Bearer ${actualKey}`;
+      headers['Authorization'] = `Bearer ${actualKey}`;
     }
 
     const options = {
