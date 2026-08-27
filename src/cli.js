@@ -7,11 +7,14 @@
 import { Logger } from './utils/logger.js';
 import { 
   addProvider, 
-  setKey, 
-  setModel, 
+  setKey,
+  setModel,
   listProviders, 
   setActive 
 } from './controllers/providerController.js';
+
+import { startProxyServer } from './core/proxyServer.js';
+import { syncVsCode, setupTerminal } from './controllers/integrationController.js';
 
 // Get command line arguments, skipping 'node' and the script name
 const args = process.argv.slice(2);
@@ -27,11 +30,14 @@ Usage:
   ai-proxy set-key <name> <api-key>             - Set the API key for a provider
   ai-proxy set-model <name> <model-name>        - Set the default model for a provider
   ai-proxy use <name>                           - Set a provider as the active default
+  ai-proxy start                                - Start the Smart Proxy Server
+  ai-proxy sync-vscode                          - Inject your providers into VS Code GUI
+  ai-proxy setup-terminal                       - Configure your ~/.bashrc for Claude Code
   
 Examples:
   ai-proxy add-provider gorouter https://gorouter.app/v1
   ai-proxy set-key gorouter sk-12345...
-  ai-proxy use gorouter
+  ai-proxy start
   `);
 }
 
@@ -63,9 +69,15 @@ switch (command) {
     break;
 
   case 'start':
-    // Phase 3 placeholder!
-    Logger.warn('Proxy Daemon (Phase 3) is not yet implemented!');
-    console.log('For now, you can manage your database. Check out docs/ROADMAP.md.');
+    startProxyServer();
+    break;
+
+  case 'sync-vscode':
+    syncVsCode();
+    break;
+
+  case 'setup-terminal':
+    setupTerminal();
     break;
 
   default:
