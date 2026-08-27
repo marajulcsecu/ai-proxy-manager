@@ -11,7 +11,7 @@ ai-proxy add-provider tabitoken https://tabitoken.com/v1
 ## Step 2: Set your API Key
 Add the secret API key provided to you by Tabitoken (or whichever provider you are using).
 ```bash
-ai-proxy set-key tabitoken sk-1oGrKaw1mIxQ5GQYS71OXmu0F7xGWcrlqrpGHt2k3CzLB23p
+ai-proxy set-key tabitoken sk-your-secret-api-key-here...
 ```
 
 ## Step 3: Set the Target Model
