@@ -62,6 +62,8 @@ export function syncVsCode() {
     Logger.error(error.message);
   }
 }
+
+/**
  * Injects the AI Proxy environment variables into the user's ~/.bashrc file.
  */
 export function setupTerminal() {
