@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/marajulcsecu/ai-proxy-manager/security/advisories/new
+    about: Report a vulnerability privately instead of opening a public issue.
+  - name: Setup help
+    url: https://github.com/marajulcsecu/ai-proxy-manager/blob/master/docs/TROUBLESHOOTING.md
+    about: Read the troubleshooting guide before filing a bug.

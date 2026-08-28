@@ -1,0 +1,10 @@
+# The project ships with zero npm dependencies, so only the CI actions
+# themselves need watching.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci

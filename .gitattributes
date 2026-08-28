@@ -1,0 +1,10 @@
+# Normalise line endings so the shell snippets we write stay POSIX-clean.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.svg text
+*.sh text eol=lf
+
+# Keep generated screenshots out of diffs and language stats.
+docs/images/* linguist-documentation

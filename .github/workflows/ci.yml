@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18.x', '20.x', '22.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # The project has zero runtime and dev dependencies, so there is
+      # deliberately no install step.
+      - name: Check every module parses
+        run: find src tests -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Run the test suite
+        run: npm test
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan tracked files for credentials
+        run: ./scripts/check-secrets.sh
+
+  cli:
+    name: cli smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      # Exercise the CLI against a throwaway config directory, then make sure
+      # the daemon starts, serves the dashboard and stops cleanly.
+      - name: Provider and model commands
+        env:
+          AI_PROXY_HOME: ${{ runner.temp }}/ai-proxy
+        run: |
+          node src/cli.js version
+          node src/cli.js add-provider demo https://demo.example/v1
+          node src/cli.js set-key demo sk-example-key-0123456789abcdef
+          node src/cli.js add-model demo demo-model
+          node src/cli.js use demo
+          node src/cli.js list
+          node src/cli.js status
+
+      - name: Daemon lifecycle
+        env:
+          AI_PROXY_HOME: ${{ runner.temp }}/ai-proxy
+        run: |
+          node src/cli.js start --daemon --port 8399
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:8399/api/status > /dev/null && break
+            sleep 0.5
+          done
+          curl -sf http://127.0.0.1:8399/api/status | head -c 200; echo
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8399/)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: attacker.example' http://127.0.0.1:8399/api/providers)" = "403"
+          node src/cli.js stop
