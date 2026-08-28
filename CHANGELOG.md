@@ -120,4 +120,4 @@ First working version.
   `docs/DASHBOARD_PLAN.md`, `docs/CONTEXT.md`.
 
 [1.1.0]: https://github.com/marajulcsecu/ai-proxy-manager/compare/e31a2bc...v1.1.0
-[1.0.0]: https://github.com/marajulcsecu/ai-proxy-manager/releases/tag/v1.0.0
+[1.0.0]: https://github.com/marajulcsecu/ai-proxy-manager/commits/e31a2bc
