@@ -1,7 +1,14 @@
 /**
- * @fileoverview The core HTTP/HTTPS Smart Proxy engine.
- * Routes requests dynamically based on the active config or token prefixes.
- * Also serves the web dashboard on "/" and REST API on "/api/*".
+ * @fileoverview The HTTP server: dashboard + REST API + smart proxy engine.
+ *
+ * Routing order for every request:
+ *   1. Dashboard assets  ("/", "/style.css", "/app.js", ...)
+ *   2. REST API          ("/api/*")
+ *   3. Proxy engine      (everything else -> the resolved provider)
+ *
+ * The proxy re-reads configuration per request (mtime-cached), so switching
+ * provider or model in the CLI or dashboard applies to the next request with
+ * no restart.
  */
 
 import http from 'http';
@@ -9,240 +16,521 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { loadConfig } from './configManager.js';
+import { tryLoadConfig, migrateConfig } from './configManager.js';
 import { handleApiRequest } from './apiRoutes.js';
-import { logRequest, updateRequestStatus } from './requestLogger.js';
+import {
+  startRequest, finishRequest, markFirstByte, attachBody,
+  configureLogger, restorePersistedLogs
+} from './requestLogger.js';
+import { resolveUpstream, isModelBearingPath } from './upstream.js';
+import { buildUpstreamHeaders, extractClientToken } from './headers.js';
+import { writePidFile, removePidFile, findPortOwner } from './daemon.js';
+import { setRuntime } from './runtime.js';
 import { Logger } from '../utils/logger.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DASHBOARD_DIR = path.join(__dirname, '..', 'dashboard');
+const DASHBOARD_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'dashboard');
 
-const SPOOFED_HEADERS = {
-  'user-agent': 'codex_cli_rs/0.101.0',
-  'anthropic-version': '2023-06-01',
-  'x-stainless-lang': 'js',
-  'x-stainless-package-version': '0.24.0',
-  'x-stainless-os': 'linux',
-  'x-stainless-arch': 'x64',
-  'x-stainless-runtime': 'node',
-  'x-stainless-runtime-version': 'v20.0.0'
+/** Requests larger than this are rejected rather than buffered. */
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+/** Dashboard files reachable over HTTP, mapped from request path. */
+const STATIC_ROUTES = {
+  '/': 'index.html',
+  '/index.html': 'index.html',
+  '/style.css': 'style.css',
+  '/app.js': 'app.js',
+  '/favicon.svg': 'favicon.svg'
 };
 
-/** MIME type map for serving static dashboard files */
 const MIME_TYPES = {
-  '.html': 'text/html',
-  '.css': 'text/css',
-  '.js': 'application/javascript',
-  '.json': 'application/json',
-  '.png': 'image/png',
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
   '.ico': 'image/x-icon'
 };
 
-/**
- * Serves a static file from the dashboard directory.
- * @param {import('http').ServerResponse} res
- * @param {string} filePath
- */
-function serveDashboardFile(res, filePath) {
-  const ext = path.extname(filePath);
-  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
 
+/** Splits a request target into pathname and query string. */
+function splitUrl(target) {
+  const raw = target || '/';
+  const index = raw.indexOf('?');
+  return index === -1
+    ? { pathname: raw, search: '' }
+    : { pathname: raw.slice(0, index), search: raw.slice(index) };
+}
+
+function hostnameOf(value) {
+  if (!value) return '';
+  const text = String(value).trim().toLowerCase();
+  if (text.startsWith('[')) return text.slice(1, text.indexOf(']') === -1 ? undefined : text.indexOf(']'));
+  return text.split(':')[0];
+}
+
+/**
+ * Guards the dashboard and REST API against DNS-rebinding: a remote page can
+ * make a browser connect to 127.0.0.1, but it cannot forge a local Host or
+ * Origin header. Without this, any website could read the stored API keys.
+ * @param {import('http').IncomingMessage} req
+ * @returns {boolean}
+ */
+function isLocalRequest(req) {
+  const host = hostnameOf(req.headers.host);
+  if (host && !LOCAL_HOSTNAMES.has(host) && !/^127\./.test(host)) return false;
+
+  const origin = req.headers.origin;
+  if (origin && origin !== 'null') {
+    let originHost = '';
+    try { originHost = new URL(origin).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { return false; }
+    if (!LOCAL_HOSTNAMES.has(originHost) && !/^127\./.test(originHost)) return false;
+  }
+  return true;
+}
+
+/** Sends a JSON error in the shape Anthropic clients already know how to show. */
+function sendProxyError(res, statusCode, message, type = 'proxy_error') {
+  if (res.headersSent) {
+    res.destroy();
+    return;
+  }
+  res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+}
+
+/**
+ * Serves one dashboard asset. Returns false when the path is not a known asset.
+ * @param {import('http').ServerResponse} res
+ * @param {string} pathname
+ * @returns {boolean}
+ */
+function serveStatic(res, pathname) {
+  const fileName = STATIC_ROUTES[pathname];
+  if (!fileName) return false;
+
+  const filePath = path.join(DASHBOARD_DIR, fileName);
   try {
     const content = fs.readFileSync(filePath);
-    res.writeHead(200, { 'Content-Type': contentType });
+    res.writeHead(200, {
+      'Content-Type': MIME_TYPES[path.extname(fileName)] || 'application/octet-stream',
+      'Cache-Control': 'no-cache',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer'
+    });
     res.end(content);
-  } catch (e) {
-    res.writeHead(404);
-    res.end('Not Found');
+  } catch {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Dashboard asset not found');
+  }
+  return true;
+}
+
+/**
+ * Decides which provider a request belongs to.
+ *
+ * A token of the form "<provider>:<key>" targets that provider explicitly
+ * (used by the VS Code integration); anything else uses the active provider.
+ * A placeholder key ("dummy...") means "look the real key up in config".
+ * @param {Object} config
+ * @param {string|null} token
+ * @returns {{name:string|null, key:string|null}}
+ */
+export function resolveRoute(config, token) {
+  let name = config.active_provider;
+  let clientKey = token;
+
+  if (token && token.includes(':')) {
+    const [prefix, ...rest] = token.split(':');
+    const candidate = prefix.trim().toLowerCase();
+    if (config.providers[candidate]) {
+      name = candidate;
+      const supplied = rest.join(':').trim();
+      clientKey = supplied && !supplied.toLowerCase().includes('dummy') ? supplied : null;
+    }
+  }
+
+  const provider = name ? config.providers[name] : null;
+  const usable = clientKey && !clientKey.toLowerCase().includes('dummy') && clientKey.length > 15;
+  return { name, key: usable ? clientKey : (provider?.apiKey || null) };
+}
+
+/**
+ * Reads a request body with a hard size cap.
+ * @param {import('http').IncomingMessage} req
+ * @returns {Promise<Buffer>}
+ */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        reject(Object.assign(new Error('Request body too large'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+/**
+ * Rewrites the `model` field when the provider pins one. An unset or empty
+ * defaultModel means pass-through: whatever the client asked for is kept.
+ * @param {Buffer} body
+ * @param {Object} provider
+ * @returns {{body:Buffer, originalModel:string|null, swappedModel:string|null, streaming:boolean, json:boolean}}
+ */
+function applyModelOverride(body, provider) {
+  const fallback = { body, originalModel: null, swappedModel: null, streaming: false, json: false };
+  if (!body.length) return fallback;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(body.toString('utf8'));
+  } catch {
+    // Not JSON (or malformed): forward it untouched rather than failing the
+    // request, which is what the previous implementation did.
+    return fallback;
+  }
+  if (!parsed || typeof parsed !== 'object') return fallback;
+
+  const originalModel = typeof parsed.model === 'string' ? parsed.model : null;
+  const streaming = parsed.stream === true;
+  const pinned = (provider.defaultModel || '').trim();
+
+  if (!pinned || !originalModel || originalModel === pinned) {
+    return { body, originalModel, swappedModel: originalModel, streaming, json: true };
+  }
+
+  parsed.model = pinned;
+  return {
+    body: Buffer.from(JSON.stringify(parsed), 'utf8'),
+    originalModel,
+    swappedModel: pinned,
+    streaming,
+    json: true
+  };
+}
+
+/**
+ * Forwards one request upstream and streams the response back.
+ * @param {import('http').IncomingMessage} clientReq
+ * @param {import('http').ServerResponse} clientRes
+ * @param {Object} context
+ */
+function forward(clientReq, clientRes, context) {
+  const { target, headers, body, logId, settings, providerName } = context;
+  const transport = target.isTls ? https : http;
+  let bytesOut = 0;
+  let settled = false;
+  let upstreamStatus = null;
+  let hardDeadline = null;
+
+  const finish = result => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(hardDeadline);
+    finishRequest(logId, { bytesOut, ...result });
+  };
+
+  const proxyReq = transport.request({
+    hostname: target.hostname,
+    port: target.port,
+    path: target.path,
+    method: clientReq.method,
+    headers
+  });
+
+  hardDeadline = setTimeout(() => {
+    const message = `Upstream exceeded the ${Math.round(settings.upstreamTimeoutMs / 1000)}s hard timeout`;
+    Logger.error(`[${providerName}] ${message}`);
+    finish({ error: message, statusCode: 504 });
+    proxyReq.destroy();
+    sendProxyError(clientRes, 504, message, 'timeout');
+  }, settings.upstreamTimeoutMs);
+
+  // Socket-inactivity timeout: catches providers that answer 200 and then go
+  // silent mid-stream instead of hanging the client tool forever.
+  proxyReq.setTimeout(settings.upstreamStallTimeoutMs, () => {
+    const message = `Upstream sent nothing for ${Math.round(settings.upstreamStallTimeoutMs / 1000)}s (stalled)`;
+    Logger.error(`[${providerName}] ${message}`);
+    finish({ error: message, statusCode: upstreamStatus ?? 504 });
+    proxyReq.destroy();
+    sendProxyError(clientRes, 504, message, 'timeout');
+  });
+
+  proxyReq.on('response', proxyRes => {
+    upstreamStatus = proxyRes.statusCode;
+    const isStream = String(proxyRes.headers['content-type'] || '').includes('text/event-stream');
+    const collect = !isStream && settings.captureBodies;
+    let preview = '';
+
+    proxyRes.on('data', chunk => {
+      if (bytesOut === 0) markFirstByte(logId);
+      bytesOut += chunk.length;
+      if (collect && preview.length < 4000) preview += chunk.toString('utf8');
+    });
+
+    const responseHeaders = { ...proxyRes.headers };
+    delete responseHeaders.connection;
+    delete responseHeaders['transfer-encoding'];
+
+    clientRes.writeHead(proxyRes.statusCode, responseHeaders);
+    proxyRes.pipe(clientRes, { end: true });
+
+    proxyRes.on('end', () => {
+      if (preview) attachBody(logId, 'response', preview);
+      finish({ statusCode: proxyRes.statusCode, streaming: isStream });
+      const level = proxyRes.statusCode >= 400 ? 'warn' : 'info';
+      Logger[level](`[${providerName}] ${proxyRes.statusCode} ${clientReq.method} ${target.path} (${bytesOut}B)`);
+    });
+    proxyRes.on('error', error => {
+      finish({ statusCode: proxyRes.statusCode, error: error.message, streaming: isStream });
+      clientRes.destroy();
+    });
+  });
+
+  proxyReq.on('error', error => {
+    if (settled) return;
+    const message = `${error.code ? `${error.code}: ` : ''}${error.message}`;
+    Logger.error(`[${providerName}] upstream request failed — ${message}`);
+    finish({ error: message, statusCode: 502 });
+    sendProxyError(clientRes, 502, `Could not reach ${target.hostname}: ${message}`, 'upstream_unreachable');
+  });
+
+  // Client (Claude Code, VS Code, ...) gave up: stop paying for the upstream.
+  clientRes.on('close', () => {
+    if (!settled) {
+      finish({ error: 'Client disconnected before the response completed' });
+      proxyReq.destroy();
+    }
+  });
+
+  if (body === null) {
+    clientReq.pipe(proxyReq, { end: true });
+  } else {
+    if (body.length) proxyReq.write(body);
+    proxyReq.end();
   }
 }
 
-export function startProxyServer() {
-  const initialConfig = loadConfig();
-  const PORT = initialConfig.proxy_port || 8319;
+/**
+ * Layer 3: resolve the provider, build the upstream request, forward it.
+ * @param {import('http').IncomingMessage} clientReq
+ * @param {import('http').ServerResponse} clientRes
+ * @param {string} pathname
+ * @param {string} search
+ */
+async function handleProxy(clientReq, clientRes, pathname, search) {
+  const { ok, config, error } = tryLoadConfig();
+  if (!ok) {
+    Logger.error(error.message);
+    return sendProxyError(clientRes, 500, error.message, 'config_error');
+  }
 
-  const server = http.createServer(async (clientReq, clientRes) => {
-    const reqUrl = clientReq.url;
+  const settings = config.settings;
+  const token = extractClientToken(clientReq.headers);
+  const route = resolveRoute(config, token);
+  const provider = route.name ? config.providers[route.name] : null;
 
-    // =====================================================
-    // LAYER 1: Dashboard — serve web UI on "/" and static files
-    // =====================================================
-    if (reqUrl === '/' || reqUrl === '/index.html') {
-      return serveDashboardFile(clientRes, path.join(DASHBOARD_DIR, 'index.html'));
+  if (!provider) {
+    const message = Object.keys(config.providers).length
+      ? `No active provider selected. Run: ai-proxy use <name>`
+      : `No providers configured yet. Add one: ai-proxy add-provider <name> <url>`;
+    const logId = startRequest({ method: clientReq.method, path: pathname + search, provider: route.name });
+    finishRequest(logId, { statusCode: 503, error: message });
+    return sendProxyError(clientRes, 503, message, 'not_configured');
+  }
+
+  let target;
+  try {
+    target = resolveUpstream(provider.url, pathname + search);
+  } catch (urlError) {
+    const message = `Provider '${route.name}' has an invalid URL: ${urlError.message}`;
+    Logger.error(message);
+    const logId = startRequest({ method: clientReq.method, path: pathname + search, provider: route.name });
+    finishRequest(logId, { statusCode: 500, error: message });
+    return sendProxyError(clientRes, 500, message, 'config_error');
+  }
+
+  if (!route.key) {
+    const message = `Provider '${route.name}' has no API key. Run: ai-proxy set-key ${route.name} <key>`;
+    const logId = startRequest({
+      method: clientReq.method, path: pathname + search, provider: route.name, targetHost: target.hostname
+    });
+    finishRequest(logId, { statusCode: 401, error: message });
+    return sendProxyError(clientRes, 401, message, 'authentication_error');
+  }
+
+  const shouldBuffer = clientReq.method === 'POST' && isModelBearingPath(pathname);
+  let body = null;
+  let override = { originalModel: null, swappedModel: null, streaming: false };
+
+  if (shouldBuffer) {
+    try {
+      const raw = await readBody(clientReq);
+      override = applyModelOverride(raw, provider);
+      body = override.body;
+    } catch (bodyError) {
+      return sendProxyError(clientRes, bodyError.statusCode || 400, bodyError.message, 'invalid_request_error');
     }
-    if (reqUrl.startsWith('/dashboard/') || reqUrl === '/style.css' || reqUrl === '/app.js' || reqUrl === '/favicon.ico') {
-      const fileName = reqUrl === '/favicon.ico' ? 'favicon.ico' : path.basename(reqUrl);
-      return serveDashboardFile(clientRes, path.join(DASHBOARD_DIR, fileName));
+  }
+
+  const headers = buildUpstreamHeaders({
+    incoming: clientReq.headers,
+    hostHeader: target.hostHeader,
+    apiKey: route.key,
+    spoof: settings.spoofHeaders !== false
+  });
+  if (body !== null) {
+    headers['content-length'] = String(body.length);
+  } else if (clientReq.headers['content-length']) {
+    // Preserve the original framing; some upstreams reject chunked uploads.
+    headers['content-length'] = clientReq.headers['content-length'];
+  }
+
+  const logId = startRequest({
+    method: clientReq.method,
+    path: pathname + search,
+    provider: route.name,
+    targetHost: target.hostname,
+    targetUrl: target.displayUrl,
+    originalModel: override.originalModel,
+    swappedModel: override.swappedModel,
+    streaming: override.streaming,
+    client: String(clientReq.headers['x-client-name'] || clientReq.headers['user-agent'] || '').slice(0, 120),
+    bytesIn: body ? body.length : 0
+  });
+
+  if (body && settings.captureBodies) attachBody(logId, 'request', body.toString('utf8'));
+  if (override.originalModel && override.swappedModel && override.originalModel !== override.swappedModel) {
+    Logger.info(`[${route.name}] model ${override.originalModel} → ${override.swappedModel}`);
+  }
+
+  forward(clientReq, clientRes, { target, headers, body, logId, settings, providerName: route.name });
+}
+
+/**
+ * Boots the server.
+ * @param {{port?:number, host?:string, silent?:boolean, managePidFile?:boolean}} [options]
+ * @returns {Promise<import('http').Server>} resolves once listening
+ */
+export function startProxyServer(options = {}) {
+  try { migrateConfig(); } catch { /* a broken file is reported per request */ }
+
+  const { config } = tryLoadConfig();
+  // Port 0 is meaningful (bind any free port), so do not treat it as unset.
+  const port = options.port === undefined || options.port === null
+    ? (config.proxy_port || 8319)
+    : Number(options.port);
+  const host = options.host || '127.0.0.1';
+  const managePidFile = options.managePidFile !== false;
+
+  configureLogger(config.settings);
+  if (config.settings.persistLogs) restorePersistedLogs();
+
+  const server = http.createServer((clientReq, clientRes) => {
+    const { pathname, search } = splitUrl(clientReq.url);
+
+    // Browsers ask for this on every page load; answer locally instead of
+    // proxying it upstream as a bogus API call.
+    if (pathname === '/favicon.ico' || pathname === '/robots.txt') {
+      clientRes.writeHead(204);
+      return clientRes.end();
     }
 
-    // =====================================================
-    // LAYER 2: REST API — handle /api/* routes
-    // =====================================================
-    if (reqUrl.startsWith('/api/')) {
-      const handled = await handleApiRequest(clientReq, clientRes);
-      if (handled) return;
-      // If no API route matched, fall through to 404
-      clientRes.writeHead(404, { 'Content-Type': 'application/json' });
-      return clientRes.end(JSON.stringify({ error: 'API route not found.' }));
-    }
-
-    // =====================================================
-    // LAYER 3: Proxy Engine — forward /v1/* to upstream
-    // =====================================================
-
-    // 1. Dynamically read config on every request (allows instant provider switching!)
-    const config = loadConfig();
-    let token = null;
-
-    const authHeader = clientReq.headers['authorization'];
-    const xApiKeyHeader = clientReq.headers['x-api-key'] || clientReq.headers['api-key'];
-    if (authHeader && authHeader.startsWith('Bearer ')) token = authHeader.slice(7).trim();
-    else if (authHeader) token = authHeader.trim();
-    else if (xApiKeyHeader) token = xApiKeyHeader.trim();
-
-    let targetProviderName = config.active_provider;
-
-    // 2. Smart Routing: Check if client passed a targeted token (e.g., "gorouter:sk-123...")
-    if (token && token.includes(':')) {
-      const parts = token.split(':');
-      if (config.providers[parts[0]]) {
-        targetProviderName = parts[0];
-        // If they provided an actual key after the colon, use it. Otherwise, use stored key.
-        if (parts[1] && parts[1] !== 'dummy') {
-          token = parts.slice(1).join(':');
-        } else {
-          token = 'dummy'; // Force database lookup
-        }
+    if (STATIC_ROUTES[pathname] || pathname.startsWith('/api/')) {
+      if (!isLocalRequest(clientReq)) {
+        clientRes.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        return clientRes.end(JSON.stringify({
+          ok: false,
+          error: 'Forbidden: the dashboard and API only accept requests from localhost.'
+        }));
       }
     }
 
-    const provider = config.providers[targetProviderName];
-    if (!provider) {
-      clientRes.writeHead(500);
-      return clientRes.end(JSON.stringify({ error: `Provider '${targetProviderName}' is missing or not configured.` }));
-    }
+    if (serveStatic(clientRes, pathname)) return;
 
-    // 3. Resolve API Key (Use client key if valid, otherwise use database key)
-    const actualKey = (token && !token.includes('dummy') && token.length > 15)
-      ? token
-      : provider.apiKey;
-
-    // 4. Resolve Target URL
-    const targetHost = provider.url.replace(/^https?:\/\//, '').split('/')[0];
-
-    // Create outbound headers
-    const headers = { ...clientReq.headers, ...SPOOFED_HEADERS, host: targetHost };
-
-    if (actualKey) {
-      // Supply both header formats for maximum provider compatibility
-      headers['x-api-key'] = actualKey;
-      headers['Authorization'] = `Bearer ${actualKey}`;
-    }
-
-    const options = {
-      hostname: targetHost,
-      port: 443,
-      path: clientReq.url,
-      method: clientReq.method,
-      headers: headers
-    };
-
-    Logger.info(`Routing ${clientReq.method} request to [${targetProviderName.toUpperCase()}] -> ${targetHost}`);
-
-    // 5. Forward Request
-    if (clientReq.method === 'POST' && clientReq.url.includes('/messages')) {
-      let reqBody = '';
-      clientReq.on('data', chunk => { reqBody += chunk.toString(); });
-      clientReq.on('end', () => {
-        try {
-          let jsonBody = JSON.parse(reqBody);
-          const originalModel = jsonBody.model;
-          let swappedModel = originalModel;
-
-          // Model Pass-Through: only rewrite if defaultModel is explicitly set
-          if (provider.defaultModel && provider.defaultModel.trim() !== '' && jsonBody.model) {
-            jsonBody.model = provider.defaultModel;
-            swappedModel = provider.defaultModel;
-            if (originalModel !== provider.defaultModel) {
-              console.log(`   🔄 Model Swap: ${originalModel} -> ${provider.defaultModel}`);
-            }
-          }
-
-          // Log this request
-          const logEntry = logRequest({
-            method: 'POST',
-            provider: targetProviderName,
-            targetHost,
-            path: clientReq.url,
-            originalModel,
-            swappedModel
-          });
-
-          const modifiedBody = JSON.stringify(jsonBody);
-          options.headers['content-length'] = Buffer.byteLength(modifiedBody);
-
-          const proxyReq = https.request(options, (proxyRes) => {
-            console.log(`   ⬅️ Response Status: ${proxyRes.statusCode}`);
-            updateRequestStatus(logEntry, proxyRes.statusCode);
-            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-            proxyRes.pipe(clientRes, { end: true });
-          });
-
-          proxyReq.on('error', (err) => {
-            Logger.error(`Proxy Request Error: ${err.message}`);
-            clientRes.writeHead(502);
-            clientRes.end(JSON.stringify({ error: err.message }));
-          });
-
-          proxyReq.write(modifiedBody);
-          proxyReq.end();
-        } catch (e) {
-          Logger.error(`Invalid JSON in request body: ${e.message}`);
-          clientRes.writeHead(400);
-          clientRes.end('Bad Request');
+    if (pathname.startsWith('/api/')) {
+      return handleApiRequest(clientReq, clientRes, pathname).catch(apiError => {
+        Logger.error(`API error on ${pathname}: ${apiError.message}`);
+        if (!clientRes.headersSent) {
+          clientRes.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+          clientRes.end(JSON.stringify({ ok: false, error: apiError.message }));
         }
       });
-    } else {
-      // Non-POST or Non-Messages routing — log and forward
-      const logEntry = logRequest({
-        method: clientReq.method,
-        provider: targetProviderName,
-        targetHost,
-        path: clientReq.url
-      });
-
-      const proxyReq = https.request(options, (proxyRes) => {
-        console.log(`   ⬅️ Response Status: ${proxyRes.statusCode}`);
-        updateRequestStatus(logEntry, proxyRes.statusCode);
-        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(clientRes, { end: true });
-      });
-      proxyReq.on('error', (err) => {
-        Logger.error(`Proxy Request Error: ${err.message}`);
-        clientRes.writeHead(502);
-        clientRes.end(JSON.stringify({ error: err.message }));
-      });
-      clientReq.pipe(proxyReq, { end: true });
     }
+
+    handleProxy(clientReq, clientRes, pathname, search).catch(proxyError => {
+      Logger.error(`Proxy error on ${pathname}: ${proxyError.message}`);
+      sendProxyError(clientRes, 500, proxyError.message);
+    });
   });
 
-  server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
-      Logger.error(`Port ${PORT} is already in use. Is the proxy already running?`);
-      Logger.info(`Try running: fuser -k ${PORT}/tcp`);
-    } else {
-      Logger.error(`Server Error: ${e.message}`);
-    }
-    process.exit(1);
-  });
+  // Long-lived streaming responses must not be cut off by the default 5s
+  // headers timeout or any request timeout.
+  server.keepAliveTimeout = 76000;
+  server.headersTimeout = 80000;
+  server.requestTimeout = 0;
 
-  server.listen(PORT, '127.0.0.1', () => {
-    Logger.header('Smart Proxy Daemon Started');
-    Logger.success(`Listening on http://127.0.0.1:${PORT}`);
-    Logger.info(`Default Active Provider: \x1b[1m${initialConfig.active_provider}\x1b[0m`);
-    Logger.info(`Dashboard: \x1b[4mhttp://127.0.0.1:${PORT}\x1b[0m`);
-    console.log('\nWaiting for requests... (Press Ctrl+C to stop)\n');
+  return new Promise((resolve, reject) => {
+    server.on('error', serverError => {
+      if (serverError.code === 'EADDRINUSE') {
+        const owner = findPortOwner(port);
+        Logger.error(`Port ${port} is already in use.`);
+        if (owner.pid) {
+          Logger.info(`Held by PID ${owner.pid}${owner.command ? ` (${owner.command})` : ''}`);
+          Logger.info(`Stop it with: ai-proxy stop   (or: kill ${owner.pid})`);
+        } else {
+          Logger.info(`Free it with: ai-proxy stop`);
+        }
+      } else {
+        Logger.error(`Server error: ${serverError.message}`);
+      }
+      reject(serverError);
+    });
+
+    server.listen(port, host, () => {
+      // With port 0 the kernel picks the port, so report what was really bound.
+      const boundPort = server.address()?.port ?? port;
+      setRuntime({ port: boundPort, host });
+      if (managePidFile) writePidFile(boundPort);
+
+      const shutdown = signal => {
+        Logger.info(`Received ${signal} — shutting down.`);
+        server.close(() => {
+          if (managePidFile) removePidFile();
+          process.exit(0);
+        });
+        // Client tools hold keep-alive sockets open; releasing the idle ones
+        // lets the port be rebound in milliseconds instead of seconds.
+        server.closeIdleConnections?.();
+        // An in-flight streaming response can still hold the server open.
+        setTimeout(() => {
+          if (managePidFile) removePidFile();
+          process.exit(0);
+        }, 3000).unref();
+      };
+      if (managePidFile) {
+        process.once('SIGINT', () => shutdown('SIGINT'));
+        process.once('SIGTERM', () => shutdown('SIGTERM'));
+      }
+
+      if (!options.silent) {
+        Logger.header('Smart Proxy Daemon Started');
+        Logger.success(`Listening on http://${host}:${boundPort}`);
+        Logger.info(`Dashboard:       http://${host}:${boundPort}`);
+        Logger.info(`Active provider: ${config.active_provider || 'none (run: ai-proxy use <name>)'}`);
+        Logger.info(`Providers:       ${Object.keys(config.providers).length}`);
+        console.log('\nWaiting for requests… (Ctrl+C to stop)\n');
+      }
+      resolve(server);
+    });
   });
 }

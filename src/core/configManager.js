@@ -1,59 +1,239 @@
 /**
- * @fileoverview Manages the reading, writing, and initialization 
- * of the configuration JSON file.
- * 
- * Location: ~/.config/ai-proxy-manager/config.json
+ * @fileoverview Reads, validates, normalizes and atomically persists the
+ * provider database at ~/.config/ai-proxy-manager/config.json.
+ *
+ * Design notes:
+ *  - The proxy reads config on every request, so reads are cached and
+ *    invalidated by mtime+size. Editing the file (or the CLI writing it)
+ *    still takes effect on the very next request.
+ *  - Writes are atomic (tmp file + rename) so a crash or a simultaneous
+ *    CLI/dashboard write can never leave a truncated JSON file behind.
+ *  - The file holds API keys, so the directory is 0700 and the file 0600.
+ *  - A bad/corrupt file throws ConfigError instead of calling process.exit(),
+ *    which previously killed the running daemon on any request.
  */
 
 import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import { Logger } from '../utils/logger.js';
+import { CONFIG_DIR, CONFIG_FILE } from './paths.js';
 
-// Base directory for our configuration
-const CONFIG_DIR = path.join(os.homedir(), '.config', 'ai-proxy-manager');
-const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+/** Thrown for unreadable / unparseable configuration. */
+export class ConfigError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.name = 'ConfigError';
+    this.cause = cause;
+  }
+}
 
-// Default initial state
-const DEFAULT_CONFIG = {
-  providers: {},
-  active_provider: null,
-  proxy_port: 8319
+/** Default settings block. Merged over whatever the user has saved. */
+export const DEFAULT_SETTINGS = {
+  /** Hard ceiling for a single upstream request (streaming replies are long). */
+  upstreamTimeoutMs: 900000,
+  /** Abort if the upstream sends no bytes for this long after responding. */
+  upstreamStallTimeoutMs: 300000,
+  /** Send browser/SDK-lookalike headers upstream (bypasses some WAFs). */
+  spoofHeaders: true,
+  /** Mirror the request history to ~/.config/ai-proxy-manager/requests.jsonl. */
+  persistLogs: true,
+  /** How many requests to keep in the in-memory ring buffer. */
+  logBufferSize: 200,
+  /** Keep request/response body previews in memory for the inspector. */
+  captureBodies: true,
+  /** Dashboard theme: 'system' | 'light' | 'dark'. */
+  theme: 'system'
 };
 
+export const DEFAULT_CONFIG = {
+  providers: {},
+  active_provider: null,
+  proxy_port: 8319,
+  settings: { ...DEFAULT_SETTINGS }
+};
+
+/** @type {{mtimeMs:number,size:number,config:Object}|null} */
+let cache = null;
+
 /**
- * Loads the configuration from disk. Creates it if it doesn't exist.
- * @returns {Object} The configuration object.
+ * Canonical provider id: lowercase, safe for URLs and shell snippets.
+ * @param {string} name
+ * @returns {string}
  */
-export function loadConfig() {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    saveConfig(DEFAULT_CONFIG);
-    return DEFAULT_CONFIG;
+export function normalizeProviderName(name) {
+  return String(name ?? '').trim().toLowerCase().replace(/[^a-z0-9._-]/g, '');
+}
+
+/** Pattern used by the REST router to capture a provider name. */
+export const PROVIDER_NAME_PATTERN = '[a-z0-9._-]+';
+
+/**
+ * Coerces arbitrary JSON into a valid config, repairing common drift:
+ * unnormalized names, missing models arrays, a defaultModel that is absent
+ * from its own models list, and an active_provider pointing nowhere.
+ * @param {any} raw
+ * @returns {Object} normalized config (new object; input is not mutated)
+ */
+export function normalizeConfig(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const out = {
+    providers: {},
+    active_provider: null,
+    proxy_port: 8319,
+    settings: { ...DEFAULT_SETTINGS }
+  };
+
+  const port = Number(src.proxy_port);
+  if (Number.isInteger(port) && port > 0 && port < 65536) out.proxy_port = port;
+
+  if (src.settings && typeof src.settings === 'object') {
+    for (const [key, fallback] of Object.entries(DEFAULT_SETTINGS)) {
+      const value = src.settings[key];
+      if (value === undefined || value === null) continue;
+      if (typeof fallback === 'boolean') out.settings[key] = Boolean(value);
+      else if (typeof fallback === 'number') {
+        const n = Number(value);
+        if (Number.isFinite(n) && n >= 0) out.settings[key] = Math.floor(n);
+      } else out.settings[key] = String(value);
+    }
+  }
+  if (!['system', 'light', 'dark'].includes(out.settings.theme)) out.settings.theme = 'system';
+  out.settings.logBufferSize = Math.min(Math.max(out.settings.logBufferSize, 10), 5000);
+
+  const providers = src.providers && typeof src.providers === 'object' ? src.providers : {};
+  for (const [rawName, rawData] of Object.entries(providers)) {
+    const name = normalizeProviderName(rawName);
+    if (!name) continue;
+    const data = rawData && typeof rawData === 'object' ? rawData : {};
+
+    const models = [];
+    if (Array.isArray(data.models)) {
+      for (const m of data.models) {
+        const model = String(m ?? '').trim();
+        if (model && !models.includes(model)) models.push(model);
+      }
+    }
+    const defaultModel = String(data.defaultModel ?? '').trim();
+    // A default model that is not in its own list breaks the dashboard's
+    // <select> (the browser silently selects the first option instead).
+    if (defaultModel && !models.includes(defaultModel)) models.unshift(defaultModel);
+
+    out.providers[name] = {
+      url: String(data.url ?? '').trim(),
+      apiKey: String(data.apiKey ?? ''),
+      defaultModel,
+      models,
+      ...(data.note ? { note: String(data.note) } : {})
+    };
   }
 
+  const active = normalizeProviderName(src.active_provider);
+  const names = Object.keys(out.providers);
+  out.active_provider = active && out.providers[active] ? active : (names[0] ?? null);
+
+  return out;
+}
+
+/**
+ * Loads (and normalizes) the configuration, caching by file mtime+size.
+ * @param {{fresh?: boolean}} [options]
+ * @returns {Object} normalized configuration
+ * @throws {ConfigError} when the file exists but cannot be read/parsed
+ */
+export function loadConfig(options = {}) {
+  let stat = null;
   try {
-    const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-    return JSON.parse(data);
+    stat = fs.statSync(CONFIG_FILE);
+  } catch {
+    // First run: materialize defaults so the CLI and dashboard agree.
+    const fresh = { ...DEFAULT_CONFIG, settings: { ...DEFAULT_SETTINGS } };
+    try { saveConfig(fresh); } catch { /* read-only home: still usable in memory */ }
+    return fresh;
+  }
+
+  if (!options.fresh && cache && cache.mtimeMs === stat.mtimeMs && cache.size === stat.size) {
+    return cache.config;
+  }
+
+  let text;
+  try {
+    text = fs.readFileSync(CONFIG_FILE, 'utf8');
   } catch (error) {
-    Logger.error(`Failed to read config file at ${CONFIG_FILE}`);
-    Logger.error(error.message);
-    process.exit(1);
+    throw new ConfigError(`Cannot read ${CONFIG_FILE}: ${error.message}`, error);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new ConfigError(
+      `${CONFIG_FILE} is not valid JSON (${error.message}). Fix or delete the file to start fresh.`,
+      error
+    );
+  }
+
+  const config = normalizeConfig(parsed);
+  cache = { mtimeMs: stat.mtimeMs, size: stat.size, config };
+  return config;
+}
+
+/**
+ * Like loadConfig() but never throws — for request paths that must stay alive.
+ * @returns {{ok: boolean, config: Object, error: Error|null}}
+ */
+export function tryLoadConfig() {
+  try {
+    return { ok: true, config: loadConfig(), error: null };
+  } catch (error) {
+    return { ok: false, config: { ...DEFAULT_CONFIG, settings: { ...DEFAULT_SETTINGS } }, error };
   }
 }
 
 /**
- * Saves the configuration object to disk.
- * @param {Object} config - The configuration object to save.
+ * Atomically writes the configuration to disk with restrictive permissions.
+ * @param {Object} config
+ * @returns {Object} the normalized config that was written
  */
 export function saveConfig(config) {
+  const normalized = normalizeConfig(config);
+  const tmpFile = `${CONFIG_FILE}.${process.pid}.tmp`;
+
   try {
-    if (!fs.existsSync(CONFIG_DIR)) {
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    }
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tmpFile, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(tmpFile, CONFIG_FILE);
+    fs.chmodSync(CONFIG_FILE, 0o600);
   } catch (error) {
-    Logger.error(`Failed to save config file to ${CONFIG_FILE}`);
-    Logger.error(error.message);
-    process.exit(1);
+    try { fs.unlinkSync(tmpFile); } catch { /* nothing to clean up */ }
+    throw new ConfigError(`Cannot write ${CONFIG_FILE}: ${error.message}`, error);
   }
+
+  try {
+    const stat = fs.statSync(CONFIG_FILE);
+    cache = { mtimeMs: stat.mtimeMs, size: stat.size, config: normalized };
+  } catch {
+    cache = null;
+  }
+  return normalized;
 }
+
+/**
+ * Rewrites the config file if normalization changed anything (schema repair).
+ * Called once at CLI/daemon start so drift is fixed instead of re-detected.
+ * @returns {boolean} true when the file was rewritten
+ */
+export function migrateConfig() {
+  if (!fs.existsSync(CONFIG_FILE)) return false;
+  const before = fs.readFileSync(CONFIG_FILE, 'utf8');
+  let parsed;
+  try { parsed = JSON.parse(before); } catch { return false; }
+  const after = `${JSON.stringify(normalizeConfig(parsed), null, 2)}\n`;
+  if (before === after) return false;
+  saveConfig(parsed);
+  return true;
+}
+
+/** Resets the in-process cache. Exposed for tests. */
+export function clearConfigCache() {
+  cache = null;
+}
+
+export { CONFIG_FILE, CONFIG_DIR };

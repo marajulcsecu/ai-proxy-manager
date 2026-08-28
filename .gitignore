@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+logs/
+
+# Local runtime artifacts
+*.pid
+.tmp/
+coverage/
+.nyc_output/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets — never commit these.
+# config.json holds provider API keys (see docs/CONTEXT.md §10).
+config.json
+.env
+.env.*
+*.pem
+*.key
+ai-proxy-export*.json

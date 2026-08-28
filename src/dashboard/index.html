@@ -1,161 +1,370 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark light">
   <title>AI Proxy Manager</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <!-- ===== HEADER ===== -->
-  <header class="header">
-    <div class="header-left">
-      <h1 class="logo">⚡ AI Proxy Manager</h1>
+  <a class="visually-hidden" href="#main">Skip to content</a>
+
+  <!-- ============================== TOP BAR ============================== -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">⚡</span>
+      <span>AI Proxy Manager</span>
+      <span class="brand-version" id="app-version"></span>
     </div>
-    <div class="header-right">
-      <span id="status-badge" class="badge badge-offline">● Connecting...</span>
-      <span id="uptime" class="meta-text"></span>
+
+    <div class="topbar-spacer"></div>
+
+    <div class="topbar-actions">
+      <span class="pill pill-muted" id="conn-pill">
+        <span class="dot" aria-hidden="true"></span><span id="conn-text">Connecting…</span>
+      </span>
+      <button class="btn btn-sm" id="palette-open" aria-label="Open command palette">
+        Search <kbd>Ctrl K</kbd>
+      </button>
+      <button class="btn btn-icon" id="theme-toggle" aria-label="Toggle colour theme" title="Toggle theme">
+        <span id="theme-icon" aria-hidden="true">◐</span>
+      </button>
     </div>
   </header>
 
-  <main class="container">
-    <!-- ===== STATS BAR ===== -->
-    <section class="stats-bar">
-      <div class="stat-card">
-        <span class="stat-value" id="stat-active">—</span>
-        <span class="stat-label">Active Provider</span>
+  <div class="shell">
+    <!-- ============================= SIDEBAR ============================= -->
+    <nav class="sidebar" aria-label="Sections">
+      <div class="nav" role="tablist">
+        <button class="nav-item" role="tab" data-view="overview" aria-current="page">
+          <span class="nav-icon" aria-hidden="true">◈</span> Overview
+        </button>
+        <button class="nav-item" role="tab" data-view="providers">
+          <span class="nav-icon" aria-hidden="true">▤</span> Providers
+          <span class="nav-badge" id="nav-provider-count"></span>
+        </button>
+        <button class="nav-item" role="tab" data-view="requests">
+          <span class="nav-icon" aria-hidden="true">≡</span> Requests
+          <span class="nav-badge" id="nav-request-count"></span>
+        </button>
+        <button class="nav-item" role="tab" data-view="setup">
+          <span class="nav-icon" aria-hidden="true">⚙</span> Setup
+        </button>
+        <button class="nav-item" role="tab" data-view="settings">
+          <span class="nav-icon" aria-hidden="true">⛭</span> Settings
+        </button>
       </div>
-      <div class="stat-card">
-        <span class="stat-value" id="stat-providers">0</span>
-        <span class="stat-label">Providers</span>
-      </div>
-      <div class="stat-card">
-        <span class="stat-value" id="stat-requests">0</span>
-        <span class="stat-label">Requests Routed</span>
-      </div>
-      <div class="stat-card">
-        <span class="stat-value" id="stat-uptime">0s</span>
-        <span class="stat-label">Uptime</span>
-      </div>
-    </section>
 
-    <!-- ===== PROVIDER SECTION ===== -->
-    <section class="section">
-      <div class="section-header">
-        <h2>Providers</h2>
-        <button class="btn btn-primary" onclick="openModal()">+ Add Provider</button>
+      <div class="sidebar-note">
+        <strong>Live routing</strong><br>
+        Provider and model changes apply to the next request — no restart needed.
       </div>
-      <div class="provider-grid" id="provider-grid">
-        <!-- Provider cards rendered dynamically -->
-      </div>
-    </section>
+    </nav>
 
-    <!-- ===== LIVE LOG SECTION ===== -->
-    <section class="section">
-      <div class="section-header">
-        <h2>Live Request Log</h2>
-        <span class="meta-text" id="log-count">0 entries</span>
-      </div>
-      <div class="log-container" id="log-container">
-        <div class="log-empty" id="log-empty">No requests yet. Waiting for traffic...</div>
-        <table class="log-table" id="log-table" style="display:none;">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Time</th>
-              <th>Method</th>
-              <th>Provider</th>
-              <th>Model</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="log-body"></tbody>
-        </table>
-      </div>
-    </section>
+    <!-- ============================== MAIN ============================== -->
+    <main class="content" id="main">
 
-    <!-- ===== CLAUDE CODE SETUP ===== -->
-    <section class="section">
-      <div class="section-header">
-        <h2>Claude Code Setup</h2>
-      </div>
-      <div class="setup-box">
-        <p>To connect Claude Code to this proxy, run these commands in your terminal:</p>
-        <pre class="code-block">
-# Step 1: Set environment variables (one-time)
-ai-proxy setup-terminal
-
-# Step 2: Reload your shell
-source ~/.bashrc
-
-# Step 3: Start Claude Code
-claude</pre>
-        <p class="meta-text">The proxy must be running (<code>ai-proxy start</code>) before launching Claude Code.</p>
-      </div>
-    </section>
-  </main>
-
-  <!-- ===== ADD/EDIT PROVIDER MODAL ===== -->
-  <div class="modal-overlay" id="modal-overlay" onclick="closeModal()">
-    <div class="modal" onclick="event.stopPropagation()">
-      <div class="modal-header">
-        <h3 id="modal-title">Add Provider</h3>
-        <button class="btn-close" onclick="closeModal()">&times;</button>
-      </div>
-      <form id="provider-form" onsubmit="submitProvider(event)">
-        <input type="hidden" id="form-editing" value="">
-        <div class="form-group">
-          <label for="form-name">Provider Name</label>
-          <input type="text" id="form-name" placeholder="e.g. tabitoken" required>
+      <!-- ---------------------------- OVERVIEW ---------------------------- -->
+      <section class="view" id="view-overview">
+        <div class="view-head">
+          <h1>Overview</h1>
+          <p class="muted">Traffic and routing state for this proxy daemon.</p>
         </div>
-        <div class="form-group">
-          <label for="form-url">Base URL</label>
-          <input type="url" id="form-url" placeholder="https://tabitoken.com/v1" required>
+
+        <div class="tiles" id="overview-tiles">
+          <div class="tile">
+            <span class="tile-label">Active provider</span>
+            <span class="tile-value is-accent" id="tile-active">—</span>
+            <span class="tile-sub" id="tile-active-sub">no model pinned</span>
+          </div>
+          <div class="tile">
+            <span class="tile-label">Requests</span>
+            <span class="tile-value" id="tile-requests">0</span>
+            <span class="tile-sub" id="tile-requests-sub">since start</span>
+          </div>
+          <div class="tile">
+            <span class="tile-label">Median latency</span>
+            <span class="tile-value" id="tile-p50">—</span>
+            <span class="tile-sub" id="tile-p95">p95 —</span>
+          </div>
+          <div class="tile">
+            <span class="tile-label">Errors</span>
+            <span class="tile-value" id="tile-errors">0</span>
+            <span class="tile-sub" id="tile-error-rate">0% of settled</span>
+          </div>
+          <div class="tile">
+            <span class="tile-label">Providers</span>
+            <span class="tile-value" id="tile-providers">0</span>
+            <span class="tile-sub" id="tile-providers-sub">0 with a key</span>
+          </div>
+          <div class="tile">
+            <span class="tile-label">Uptime</span>
+            <span class="tile-value" id="tile-uptime">—</span>
+            <span class="tile-sub" id="tile-port">port —</span>
+          </div>
         </div>
-        <div class="form-group">
-          <label for="form-key">API Key</label>
-          <input type="password" id="form-key" placeholder="sk-...">
+
+        <div class="section">
+          <div class="section-head">
+            <h2>Active route</h2>
+            <button class="btn btn-sm" data-goto="providers">Manage providers</button>
+          </div>
+          <div id="active-route"></div>
         </div>
-        <div class="form-group">
-          <label for="form-model">Default Model <span class="meta-text">(leave empty for pass-through)</span></label>
-          <input type="text" id="form-model" placeholder="e.g. claude-opus-5-thinking">
+
+        <div class="section">
+          <div class="section-head">
+            <h2>Recent requests</h2>
+            <button class="btn btn-sm" data-goto="requests">See all</button>
+          </div>
+          <div id="recent-requests"></div>
         </div>
-        <div class="form-group">
-          <label>Saved Models</label>
-          <div class="model-tags" id="model-tags-container" data-models="[]"></div>
-          <p class="meta-text" style="margin-top:6px; font-size:0.75rem;">Models can be added/removed via the "+ Model" button on each card.</p>
+      </section>
+
+      <!-- ---------------------------- PROVIDERS ---------------------------- -->
+      <section class="view" id="view-providers" hidden>
+        <div class="view-head">
+          <h1>Providers</h1>
+          <p class="muted">The active provider handles every request that does not name one explicitly.</p>
         </div>
-        <div class="form-actions">
-          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-          <button type="submit" class="btn btn-primary" id="form-submit-btn">Add Provider</button>
+
+        <div class="section-head">
+          <h2 id="providers-count-label">All providers</h2>
+          <div class="section-head-actions">
+            <button class="btn btn-sm" id="test-all-btn">Test all</button>
+            <button class="btn btn-primary btn-sm" id="add-provider-btn">+ Add provider</button>
+          </div>
+        </div>
+
+        <div class="provider-grid" id="provider-grid" aria-live="polite">
+          <div class="skeleton"></div>
+          <div class="skeleton"></div>
+        </div>
+      </section>
+
+      <!-- ---------------------------- REQUESTS ---------------------------- -->
+      <section class="view" id="view-requests" hidden>
+        <div class="view-head">
+          <h1>Requests</h1>
+          <p class="muted">Every call the proxy forwarded. Select a row for the full detail.</p>
+        </div>
+
+        <div class="log-toolbar">
+          <select class="input" id="log-filter-provider" aria-label="Filter by provider">
+            <option value="">All providers</option>
+          </select>
+          <select class="input" id="log-filter-status" aria-label="Filter by outcome">
+            <option value="">Any outcome</option>
+            <option value="ok">Succeeded</option>
+            <option value="error">Failed</option>
+            <option value="pending">In flight</option>
+          </select>
+          <label class="pill pill-muted" style="cursor:pointer">
+            <input type="checkbox" id="log-autorefresh" checked> Auto-refresh
+          </label>
+          <div class="topbar-spacer"></div>
+          <span class="dim" id="log-summary"></span>
+          <button class="btn btn-sm btn-danger" id="clear-logs-btn">Clear history</button>
+        </div>
+
+        <div id="log-area"></div>
+      </section>
+
+      <!-- ------------------------------ SETUP ------------------------------ -->
+      <section class="view" id="view-setup" hidden>
+        <div class="view-head">
+          <h1>Setup</h1>
+          <p class="muted">Point your tools at this proxy.</p>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><h2>Claude Code (terminal)</h2></div>
+          <div class="card" style="padding:16px">
+            <div class="setup-steps" id="shell-setup"></div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><h2>VS Code</h2></div>
+          <div class="card" style="padding:16px">
+            <div class="setup-steps" id="vscode-setup"></div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><h2>Anything else</h2></div>
+          <div class="card" style="padding:16px">
+            <div class="setup-steps">
+              <div class="setup-step">
+                <span class="step-num">↔</span>
+                <div class="step-body">
+                  <h3>Manual client configuration</h3>
+                  <p class="muted">Use these values in any tool that lets you set a base URL and key.
+                    A <code>provider:key</code> token routes to that provider regardless of which one is active;
+                    <code>provider:dummy</code> makes the proxy substitute the stored key.</p>
+                  <div class="code-block-wrap">
+                    <pre class="code is-command" id="manual-config"></pre>
+                    <button class="btn btn-sm btn-copy" data-copy-target="manual-config">Copy</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------------------------- SETTINGS ---------------------------- -->
+      <section class="view" id="view-settings" hidden>
+        <div class="view-head">
+          <h1>Settings</h1>
+          <p class="muted">Stored in <code id="config-path">config.json</code> and shared with the CLI.</p>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><h2>Proxy behaviour</h2></div>
+          <div class="card" style="padding:6px 16px" id="settings-switches"></div>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><h2>Network</h2></div>
+          <div class="card" style="padding:16px; display:flex; flex-direction:column; gap:14px" id="settings-network"></div>
+        </div>
+
+        <div class="section">
+          <div class="section-head"><h2>Configuration file</h2></div>
+          <div class="card" style="padding:16px; display:flex; flex-direction:column; gap:12px">
+            <p class="muted">Export a copy to move providers between machines. Keys are redacted unless you ask for them.</p>
+            <div class="section-head-actions">
+              <button class="btn btn-sm" id="export-redacted-btn">Export (redacted)</button>
+              <button class="btn btn-sm btn-danger" id="export-keys-btn">Export with keys</button>
+              <button class="btn btn-sm" id="import-btn">Import…</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ====================== PROVIDER ADD / EDIT DIALOG ====================== -->
+  <div class="overlay" id="provider-overlay" role="dialog" aria-modal="true" aria-labelledby="provider-dialog-title">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h2 id="provider-dialog-title">Add provider</h2>
+        <button class="btn btn-icon btn-ghost" data-close-overlay aria-label="Close">✕</button>
+      </div>
+      <form id="provider-form" novalidate>
+        <div class="dialog-body">
+          <div class="field">
+            <label for="pf-name">Name</label>
+            <input type="text" id="pf-name" placeholder="tabitoken" autocomplete="off" spellcheck="false" required>
+            <span class="field-hint">Lowercase id used in CLI commands and <code>provider:key</code> tokens.</span>
+          </div>
+          <div class="field">
+            <label for="pf-url">Base URL</label>
+            <input type="text" id="pf-url" placeholder="https://tabitoken.com/v1" autocomplete="off" spellcheck="false" required>
+            <span class="field-hint">Any scheme, port or path prefix — e.g. <code>http://127.0.0.1:11434/v1</code>.</span>
+          </div>
+          <div class="field">
+            <label for="pf-key">API key</label>
+            <input type="password" id="pf-key" placeholder="sk-…" autocomplete="off" spellcheck="false">
+            <span class="field-hint" id="pf-key-hint">Stored locally in config.json (file mode 600).</span>
+          </div>
+          <div class="field">
+            <label for="pf-model">Pinned model</label>
+            <input type="text" id="pf-model" placeholder="leave empty for pass-through" autocomplete="off" spellcheck="false">
+            <span class="field-hint">When set, every request is rewritten to this model. Empty keeps whatever the client sent.</span>
+          </div>
+          <div class="field">
+            <label>Saved models</label>
+            <div class="model-chips" id="pf-models"></div>
+            <div style="display:flex; gap:6px">
+              <input type="text" id="pf-model-add" placeholder="add another model…" autocomplete="off" spellcheck="false">
+              <button type="button" class="btn btn-sm" id="pf-model-add-btn">Add</button>
+            </div>
+          </div>
+          <p class="field-error" id="pf-error" hidden></p>
+        </div>
+        <div class="dialog-foot">
+          <button type="button" class="btn" data-close-overlay>Cancel</button>
+          <button type="submit" class="btn btn-primary" id="pf-submit">Add provider</button>
         </div>
       </form>
     </div>
   </div>
 
-  <!-- ===== ADD MODEL MODAL ===== -->
-  <div class="modal-overlay" id="add-model-overlay" onclick="closeAddModelModal()">
-    <div class="modal modal-sm" onclick="event.stopPropagation()">
-      <div class="modal-header">
-        <h3 id="add-model-title">Add Model</h3>
-        <button class="btn-close" onclick="closeAddModelModal()">&times;</button>
+  <!-- ============================ CONFIRM DIALOG ============================ -->
+  <div class="overlay" id="confirm-overlay" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+    <div class="dialog dialog-sm">
+      <div class="dialog-head"><h2 id="confirm-title">Are you sure?</h2></div>
+      <div class="dialog-body"><p id="confirm-message" class="muted"></p></div>
+      <div class="dialog-foot">
+        <button class="btn" id="confirm-cancel">Cancel</button>
+        <button class="btn btn-danger" id="confirm-accept">Confirm</button>
       </div>
-      <form onsubmit="submitAddModel(event)">
-        <input type="hidden" id="add-model-provider" value="">
-        <div class="form-group">
-          <label for="add-model-name">Model Name</label>
-          <input type="text" id="add-model-name" placeholder="e.g. claude-sonnet-5" required>
-        </div>
-        <div class="form-actions">
-          <button type="button" class="btn btn-secondary" onclick="closeAddModelModal()">Cancel</button>
-          <button type="submit" class="btn btn-primary">Add Model</button>
-        </div>
-      </form>
     </div>
   </div>
 
-  <!-- ===== TOAST NOTIFICATION ===== -->
-  <div class="toast" id="toast"></div>
+  <!-- ============================ IMPORT DIALOG ============================ -->
+  <div class="overlay" id="import-overlay" role="dialog" aria-modal="true" aria-labelledby="import-title">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h2 id="import-title">Import configuration</h2>
+        <button class="btn btn-icon btn-ghost" data-close-overlay aria-label="Close">✕</button>
+      </div>
+      <div class="dialog-body">
+        <div class="field">
+          <label for="import-json">Exported JSON</label>
+          <textarea id="import-json" placeholder='{ "providers": { … } }' spellcheck="false"></textarea>
+          <span class="field-hint">Providers with an empty key keep the key already stored here.</span>
+        </div>
+        <div class="switch-row">
+          <div class="switch-row-text">
+            <strong>Replace instead of merge</strong>
+            <span>Removes providers that are not in the file.</span>
+          </div>
+          <button class="switch" id="import-replace" role="switch" aria-checked="false" aria-label="Replace instead of merge"></button>
+        </div>
+        <p class="field-error" id="import-error" hidden></p>
+      </div>
+      <div class="dialog-foot">
+        <button class="btn" data-close-overlay>Cancel</button>
+        <button class="btn btn-primary" id="import-submit">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================== REQUEST DRAWER =========================== -->
+  <div class="overlay" id="detail-overlay" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+    <div class="dialog dialog-lg">
+      <div class="dialog-head">
+        <h2 id="detail-title">Request</h2>
+        <button class="btn btn-icon btn-ghost" data-close-overlay aria-label="Close">✕</button>
+      </div>
+      <div class="dialog-body" id="detail-body"></div>
+    </div>
+  </div>
+
+  <!-- =========================== COMMAND PALETTE =========================== -->
+  <div class="overlay" id="palette-overlay" role="dialog" aria-modal="true" aria-label="Command palette">
+    <div class="dialog palette">
+      <div class="palette-input-wrap">
+        <span class="dim" aria-hidden="true">⌕</span>
+        <input type="text" id="palette-input" placeholder="Switch provider, run a test, jump to a view…"
+               autocomplete="off" spellcheck="false" role="combobox" aria-expanded="true"
+               aria-controls="palette-list" aria-autocomplete="list">
+      </div>
+      <div class="palette-list" id="palette-list" role="listbox" aria-label="Commands"></div>
+      <div class="palette-foot">
+        <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+        <span><kbd>↵</kbd> run</span>
+        <span><kbd>Esc</kbd> close</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
   <script src="/app.js"></script>
 </body>

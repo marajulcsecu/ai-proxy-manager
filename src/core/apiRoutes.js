@@ -1,346 +1,509 @@
 /**
- * @fileoverview Internal REST API handler for the web dashboard.
- * All endpoints are under /api/* and return JSON responses.
+ * @fileoverview REST API behind /api/*, consumed by the dashboard.
+ *
+ * Notes:
+ *  - Routing is done on the pathname, so query strings no longer fall through
+ *    to the proxy engine (GET /api/status?t=1 used to 404).
+ *  - Responses never include an API key unless it is explicitly requested via
+ *    /api/providers/:name/key, and no CORS wildcard is sent: the server only
+ *    answers same-origin, localhost requests (enforced in proxyServer.js).
  */
 
-import { loadConfig, saveConfig } from './configManager.js';
-import { getLogs, getStatus } from './requestLogger.js';
+import {
+  loadConfig, saveConfig, tryLoadConfig, normalizeProviderName,
+  PROVIDER_NAME_PATTERN, DEFAULT_SETTINGS, CONFIG_FILE
+} from './configManager.js';
+import { getLogs, getLogById, getStatus, clearLogs, configureLogger } from './requestLogger.js';
+import { parseProviderUrl } from './upstream.js';
+import { testProvider } from './providerTester.js';
+import { getDaemonStatus } from './daemon.js';
+import { getRuntime } from './runtime.js';
+import {
+  getIntegrationStatus, applyShellSetup, removeShellSetup, syncVsCode
+} from '../controllers/integrationController.js';
+import { readPackageVersion } from '../utils/version.js';
+
+const MAX_API_BODY_BYTES = 2 * 1024 * 1024;
+const NAME = PROVIDER_NAME_PATTERN;
 
 /**
- * Parses a JSON request body from an incoming HTTP request.
+ * Reads and JSON-parses a request body.
  * @param {import('http').IncomingMessage} req
  * @returns {Promise<Object>}
  */
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('data', chunk => {
+      body += chunk;
+      if (body.length > MAX_API_BODY_BYTES) {
+        reject(new Error('Request body too large'));
+        req.destroy();
+      }
+    });
     req.on('end', () => {
+      if (!body.trim()) return resolve({});
       try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (e) {
+        resolve(JSON.parse(body));
+      } catch {
         reject(new Error('Invalid JSON body'));
       }
     });
+    req.on('error', reject);
   });
 }
 
 /**
- * Sends a JSON response.
  * @param {import('http').ServerResponse} res
  * @param {number} statusCode
  * @param {Object} data
  */
 function sendJSON(res, statusCode, data) {
+  const payload = JSON.stringify(data);
   res.writeHead(statusCode, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*'
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(payload),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
   });
-  res.end(JSON.stringify(data));
+  res.end(payload);
+}
+
+/** Shows enough of a key to recognise it, never enough to use it. */
+function maskKey(key) {
+  if (!key) return '';
+  const text = String(key);
+  if (text.length <= 12) return '••••••';
+  return `${text.slice(0, 5)}…${text.slice(-4)}`;
 }
 
 /**
- * Handles all /api/* requests. Returns true if the request was handled.
+ * Public shape of a provider (no secrets).
+ * @param {string} name
+ * @param {Object} data
+ * @param {Object} config
+ */
+function providerView(name, data, config) {
+  let host = null;
+  let urlValid = true;
+  try {
+    host = parseProviderUrl(data.url).hostHeader;
+  } catch {
+    urlValid = false;
+  }
+  return {
+    name,
+    url: data.url,
+    host,
+    urlValid,
+    defaultModel: data.defaultModel || '',
+    models: data.models || [],
+    hasKey: Boolean(data.apiKey),
+    keyPreview: maskKey(data.apiKey),
+    passThrough: !data.defaultModel,
+    isActive: name === config.active_provider
+  };
+}
+
+const routes = [];
+
+/**
+ * @param {string} method
+ * @param {RegExp} pattern - matched against the pathname
+ * @param {(ctx:Object) => Promise<void>|void} handler
+ */
+function route(method, pattern, handler) {
+  routes.push({ method, pattern, handler });
+}
+
+// ---------------------------------------------------------------- meta/status
+
+route('GET', /^\/api\/meta$/, ({ res }) => {
+  const daemon = getDaemonStatus();
+  const { config } = tryLoadConfig();
+  sendJSON(res, 200, {
+    ok: true,
+    version: readPackageVersion(),
+    node: process.version,
+    pid: process.pid,
+    configPath: CONFIG_FILE,
+    port: getRuntime().port ?? config.proxy_port,
+    configuredPort: config.proxy_port,
+    daemon
+  });
+});
+
+route('GET', /^\/api\/status$/, ({ res }) => {
+  const { ok, config, error } = tryLoadConfig();
+  const status = getStatus();
+  sendJSON(res, 200, {
+    ok,
+    configError: ok ? null : error.message,
+    activeProvider: config.active_provider,
+    providerCount: Object.keys(config.providers).length,
+    port: getRuntime().port ?? config.proxy_port,
+    configuredPort: config.proxy_port,
+    version: readPackageVersion(),
+    ...status
+  });
+});
+
+// ------------------------------------------------------------------ providers
+
+route('GET', /^\/api\/providers$/, ({ res }) => {
+  const config = loadConfig();
+  const providers = Object.entries(config.providers).map(([name, data]) => providerView(name, data, config));
+  sendJSON(res, 200, { ok: true, providers, activeProvider: config.active_provider });
+});
+
+route('POST', /^\/api\/providers$/, async ({ req, res }) => {
+  const body = await parseBody(req);
+  const name = normalizeProviderName(body.name);
+
+  if (!name) return sendJSON(res, 400, { ok: false, error: 'A provider name is required (letters, digits, . _ -).' });
+  if (!body.url) return sendJSON(res, 400, { ok: false, error: 'A base URL is required.' });
+
+  try {
+    parseProviderUrl(body.url);
+  } catch (error) {
+    return sendJSON(res, 400, { ok: false, error: error.message });
+  }
+
+  const config = loadConfig();
+  if (config.providers[name]) {
+    return sendJSON(res, 409, { ok: false, error: `Provider '${name}' already exists. Edit it instead.` });
+  }
+
+  const models = Array.isArray(body.models) ? body.models.map(String) : [];
+  config.providers[name] = {
+    url: String(body.url).trim(),
+    apiKey: body.apiKey ? String(body.apiKey).trim() : '',
+    defaultModel: body.defaultModel ? String(body.defaultModel).trim() : '',
+    models
+  };
+  if (!config.active_provider) config.active_provider = name;
+
+  saveConfig(config);
+  sendJSON(res, 201, { ok: true, message: `Provider '${name}' created.`, name });
+});
+
+route('GET', new RegExp(`^/api/providers/(${NAME})$`), ({ res, params }) => {
+  const config = loadConfig();
+  const data = config.providers[params[0]];
+  if (!data) return sendJSON(res, 404, { ok: false, error: `Provider '${params[0]}' not found.` });
+  sendJSON(res, 200, { ok: true, provider: providerView(params[0], data, config) });
+});
+
+route('PUT', new RegExp(`^/api/providers/(${NAME})$`), async ({ req, res, params }) => {
+  const name = params[0];
+  const body = await parseBody(req);
+  const config = loadConfig();
+  if (!config.providers[name]) return sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+
+  if (body.url !== undefined) {
+    try {
+      parseProviderUrl(body.url);
+    } catch (error) {
+      return sendJSON(res, 400, { ok: false, error: error.message });
+    }
+    config.providers[name].url = String(body.url).trim();
+  }
+  // An empty apiKey means "leave the stored key alone".
+  if (body.apiKey) config.providers[name].apiKey = String(body.apiKey).trim();
+  if (body.clearKey === true) config.providers[name].apiKey = '';
+  if (body.defaultModel !== undefined) config.providers[name].defaultModel = String(body.defaultModel).trim();
+  if (Array.isArray(body.models)) config.providers[name].models = body.models.map(String);
+
+  saveConfig(config);
+  sendJSON(res, 200, { ok: true, message: `Provider '${name}' updated.` });
+});
+
+route('DELETE', new RegExp(`^/api/providers/(${NAME})$`), ({ res, params }) => {
+  const name = params[0];
+  const config = loadConfig();
+  if (!config.providers[name]) return sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+
+  delete config.providers[name];
+  if (config.active_provider === name) config.active_provider = Object.keys(config.providers)[0] ?? null;
+
+  saveConfig(config);
+  sendJSON(res, 200, { ok: true, message: `Provider '${name}' deleted.`, activeProvider: config.active_provider });
+});
+
+route('POST', new RegExp(`^/api/providers/(${NAME})/activate$`), ({ res, params }) => {
+  const name = params[0];
+  const config = loadConfig();
+  if (!config.providers[name]) return sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+
+  config.active_provider = name;
+  saveConfig(config);
+  sendJSON(res, 200, { ok: true, message: `Active provider is now '${name}'.` });
+});
+
+route('GET', new RegExp(`^/api/providers/(${NAME})/key$`), ({ res, params }) => {
+  const config = loadConfig();
+  const data = config.providers[params[0]];
+  if (!data) return sendJSON(res, 404, { ok: false, error: `Provider '${params[0]}' not found.` });
+  sendJSON(res, 200, { ok: true, apiKey: data.apiKey || '' });
+});
+
+route('POST', new RegExp(`^/api/providers/(${NAME})/test$`), async ({ req, res, params }) => {
+  const body = await parseBody(req).catch(() => ({}));
+  const config = loadConfig();
+  const provider = config.providers[params[0]];
+  if (!provider) return sendJSON(res, 404, { ok: false, error: `Provider '${params[0]}' not found.` });
+
+  const result = await testProvider(provider, {
+    model: body.model,
+    spoof: config.settings.spoofHeaders !== false
+  });
+  sendJSON(res, 200, { ok: true, provider: params[0], result });
+});
+
+// --------------------------------------------------------------------- models
+
+route('POST', new RegExp(`^/api/providers/(${NAME})/model$`), async ({ req, res, params }) => {
+  const name = params[0];
+  const body = await parseBody(req);
+  const config = loadConfig();
+  if (!config.providers[name]) return sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+  if (body.model === undefined) return sendJSON(res, 400, { ok: false, error: 'Missing field: model' });
+
+  const model = String(body.model).trim();
+  const provider = config.providers[name];
+  provider.models = provider.models || [];
+  // An empty model is meaningful: it re-enables pass-through mode.
+  if (model && !provider.models.includes(model)) provider.models.push(model);
+  provider.defaultModel = model;
+
+  saveConfig(config);
+  sendJSON(res, 200, {
+    ok: true,
+    message: model ? `'${name}' now uses '${model}'.` : `'${name}' now passes the client's model through.`
+  });
+});
+
+async function addModelHandler({ req, res, params }) {
+  const name = params[0];
+  const body = await parseBody(req);
+  const config = loadConfig();
+  if (!config.providers[name]) return sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+
+  const model = String(body.model ?? '').trim();
+  if (!model) return sendJSON(res, 400, { ok: false, error: 'Missing field: model' });
+
+  const provider = config.providers[name];
+  provider.models = provider.models || [];
+  if (provider.models.includes(model)) {
+    return sendJSON(res, 409, { ok: false, error: `'${model}' is already in the list.` });
+  }
+  provider.models.push(model);
+  if (!provider.defaultModel) provider.defaultModel = model;
+
+  saveConfig(config);
+  sendJSON(res, 201, { ok: true, message: `Added '${model}' to '${name}'.` });
+}
+
+async function removeModelHandler({ res, params, name: providerName, model: modelName, req }) {
+  const name = providerName ?? params[0];
+  const model = modelName ?? String((await parseBody(req)).model ?? '').trim();
+  const config = loadConfig();
+  if (!config.providers[name]) return sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+  if (!model) return sendJSON(res, 400, { ok: false, error: 'Missing field: model' });
+
+  const provider = config.providers[name];
+  provider.models = (provider.models || []).filter(m => m !== model);
+  if (provider.defaultModel === model) provider.defaultModel = provider.models[0] || '';
+
+  saveConfig(config);
+  sendJSON(res, 200, {
+    ok: true,
+    message: `Removed '${model}' from '${name}'.`,
+    defaultModel: provider.defaultModel
+  });
+}
+
+route('POST', new RegExp(`^/api/providers/(${NAME})/models$`), addModelHandler);
+route('POST', new RegExp(`^/api/providers/(${NAME})/models/add$`), addModelHandler);
+route('POST', new RegExp(`^/api/providers/(${NAME})/models/remove$`), removeModelHandler);
+route('DELETE', new RegExp(`^/api/providers/(${NAME})/models/(.+)$`), ctx =>
+  removeModelHandler({ ...ctx, name: ctx.params[0], model: decodeURIComponent(ctx.params[1]) })
+);
+
+// ----------------------------------------------------------------------- logs
+
+route('GET', /^\/api\/logs$/, ({ res, query }) => {
+  const logs = getLogs({
+    limit: query.get('limit') ?? undefined,
+    provider: query.get('provider') ?? undefined,
+    status: query.get('status') ?? undefined
+  });
+  sendJSON(res, 200, { ok: true, logs });
+});
+
+route('GET', /^\/api\/logs\/(\d+)$/, ({ res, params }) => {
+  const entry = getLogById(Number(params[0]));
+  if (!entry) return sendJSON(res, 404, { ok: false, error: `No request with id ${params[0]}.` });
+  sendJSON(res, 200, { ok: true, log: entry });
+});
+
+route('DELETE', /^\/api\/logs$/, ({ res }) => {
+  clearLogs();
+  sendJSON(res, 200, { ok: true, message: 'Request history cleared.' });
+});
+
+// ------------------------------------------------------------------- settings
+
+route('GET', /^\/api\/settings$/, ({ res }) => {
+  const config = loadConfig();
+  sendJSON(res, 200, { ok: true, settings: config.settings, proxyPort: config.proxy_port, defaults: DEFAULT_SETTINGS });
+});
+
+route('PUT', /^\/api\/settings$/, async ({ req, res }) => {
+  const body = await parseBody(req);
+  const config = loadConfig();
+  let restartRequired = false;
+
+  if (body.proxy_port !== undefined) {
+    const port = Number(body.proxy_port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return sendJSON(res, 400, { ok: false, error: 'proxy_port must be an integer between 1 and 65535.' });
+    }
+    if (port !== config.proxy_port) restartRequired = true;
+    config.proxy_port = port;
+  }
+
+  for (const key of Object.keys(DEFAULT_SETTINGS)) {
+    if (body[key] !== undefined) config.settings[key] = body[key];
+  }
+
+  const saved = saveConfig(config);
+  configureLogger(saved.settings);
+  sendJSON(res, 200, {
+    ok: true,
+    message: restartRequired ? 'Saved. Restart the proxy to bind the new port.' : 'Settings saved.',
+    settings: saved.settings,
+    restartRequired
+  });
+});
+
+// --------------------------------------------------------------- config io
+
+route('GET', /^\/api\/config\/export$/, ({ res, query }) => {
+  const config = loadConfig();
+  const redact = query.get('redact') !== '0';
+  const exported = JSON.parse(JSON.stringify(config));
+  if (redact) {
+    for (const provider of Object.values(exported.providers)) provider.apiKey = '';
+  }
+  sendJSON(res, 200, {
+    ok: true,
+    redacted: redact,
+    exportedAt: new Date().toISOString(),
+    config: exported
+  });
+});
+
+route('POST', /^\/api\/config\/import$/, async ({ req, res }) => {
+  const body = await parseBody(req);
+  const incoming = body.config ?? body;
+  if (!incoming || typeof incoming !== 'object' || typeof incoming.providers !== 'object') {
+    return sendJSON(res, 400, { ok: false, error: 'Expected an object with a "providers" map.' });
+  }
+
+  const mode = body.mode === 'replace' ? 'replace' : 'merge';
+  const current = loadConfig();
+  const next = mode === 'replace'
+    ? { ...incoming, providers: {} }
+    : { ...current, providers: { ...current.providers } };
+
+  let imported = 0;
+  for (const [rawName, rawData] of Object.entries(incoming.providers)) {
+    const name = normalizeProviderName(rawName);
+    if (!name || !rawData || typeof rawData !== 'object') continue;
+    const existing = current.providers[name];
+    next.providers[name] = {
+      url: String(rawData.url ?? existing?.url ?? ''),
+      // A redacted export carries no key — never wipe a working one.
+      apiKey: rawData.apiKey ? String(rawData.apiKey) : (existing?.apiKey ?? ''),
+      defaultModel: String(rawData.defaultModel ?? existing?.defaultModel ?? ''),
+      models: Array.isArray(rawData.models) ? rawData.models.map(String) : (existing?.models ?? [])
+    };
+    imported++;
+  }
+
+  if (incoming.active_provider) next.active_provider = normalizeProviderName(incoming.active_provider);
+  if (incoming.proxy_port) next.proxy_port = Number(incoming.proxy_port);
+
+  const saved = saveConfig(next);
+  sendJSON(res, 200, {
+    ok: true,
+    message: `Imported ${imported} provider(s) (${mode}).`,
+    imported,
+    providers: Object.keys(saved.providers)
+  });
+});
+
+// --------------------------------------------------------------- integrations
+
+route('GET', /^\/api\/integrations$/, ({ res }) => {
+  sendJSON(res, 200, { ok: true, integrations: getIntegrationStatus() });
+});
+
+route('POST', /^\/api\/integrations\/shell$/, ({ res }) => {
+  const result = applyShellSetup({ quiet: true });
+  sendJSON(res, result.ok ? 200 : 500, { ...result, integrations: getIntegrationStatus() });
+});
+
+route('DELETE', /^\/api\/integrations\/shell$/, ({ res }) => {
+  const result = removeShellSetup({ quiet: true });
+  sendJSON(res, result.ok ? 200 : 500, { ...result, integrations: getIntegrationStatus() });
+});
+
+route('POST', /^\/api\/integrations\/vscode$/, ({ res }) => {
+  const result = syncVsCode({ quiet: true });
+  sendJSON(res, result.ok ? 200 : 500, { ...result, integrations: getIntegrationStatus() });
+});
+
+/**
+ * Dispatches an /api/* request.
  * @param {import('http').IncomingMessage} req
  * @param {import('http').ServerResponse} res
- * @returns {Promise<boolean>}
+ * @param {string} [pathname] - pre-split pathname (query string removed)
+ * @returns {Promise<boolean>} true when a route handled the request
  */
-export async function handleApiRequest(req, res) {
-  const url = req.url;
-  const method = req.method;
+export async function handleApiRequest(req, res, pathname) {
+  const url = new URL(req.url, 'http://127.0.0.1');
+  const routePath = pathname || url.pathname;
 
-  // Handle CORS preflight
-  if (method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
-    });
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, { Allow: 'GET, POST, PUT, DELETE, OPTIONS' });
     res.end();
     return true;
   }
 
-  // ----------------------------------------------------------
-  // GET /api/status — Server health & uptime
-  // ----------------------------------------------------------
-  if (url === '/api/status' && method === 'GET') {
-    const config = loadConfig();
-    const status = getStatus();
-    sendJSON(res, 200, {
-      ok: true,
-      activeProvider: config.active_provider,
-      providerCount: Object.keys(config.providers).length,
-      ...status
+  const matchesPath = routes.filter(entry => entry.pattern.test(routePath));
+
+  for (const entry of matchesPath) {
+    if (entry.method !== req.method) continue;
+    const match = routePath.match(entry.pattern);
+    try {
+      await entry.handler({ req, res, params: match.slice(1), query: url.searchParams, pathname: routePath });
+    } catch (error) {
+      if (!res.headersSent) sendJSON(res, 400, { ok: false, error: error.message });
+    }
+    return true;
+  }
+
+  if (matchesPath.length) {
+    sendJSON(res, 405, {
+      ok: false,
+      error: `${req.method} is not allowed on ${routePath}.`,
+      allowed: [...new Set(matchesPath.map(entry => entry.method))]
     });
     return true;
   }
 
-  // ----------------------------------------------------------
-  // GET /api/logs — Recent request log
-  // ----------------------------------------------------------
-  if (url === '/api/logs' && method === 'GET') {
-    sendJSON(res, 200, { ok: true, logs: getLogs() });
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // GET /api/providers — List all providers
-  // ----------------------------------------------------------
-  if (url === '/api/providers' && method === 'GET') {
-    const config = loadConfig();
-    const providers = Object.entries(config.providers).map(([name, data]) => ({
-      name,
-      url: data.url,
-      defaultModel: data.defaultModel || '',
-      models: data.models || [],
-      hasKey: !!data.apiKey,
-      isActive: name === config.active_provider
-    }));
-    sendJSON(res, 200, { ok: true, providers });
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // POST /api/providers — Add a new provider
-  // Body: { name, url, apiKey?, defaultModel? }
-  // ----------------------------------------------------------
-  if (url === '/api/providers' && method === 'POST') {
-    try {
-      const body = await parseBody(req);
-      if (!body.name || !body.url) {
-        sendJSON(res, 400, { ok: false, error: 'Missing required fields: name, url' });
-        return true;
-      }
-
-      const config = loadConfig();
-      const name = body.name.toLowerCase().replace(/[^a-z0-9_-]/g, '');
-
-      const defaultModel = body.defaultModel || '';
-      const models = Array.isArray(body.models) ? body.models : [];
-      // If a default model is provided, ensure it's in the models list
-      if (defaultModel && !models.includes(defaultModel)) {
-        models.unshift(defaultModel);
-      }
-
-      config.providers[name] = {
-        url: body.url,
-        apiKey: body.apiKey || config.providers[name]?.apiKey || '',
-        defaultModel,
-        models
-      };
-
-      // Auto-activate if first provider
-      if (!config.active_provider) {
-        config.active_provider = name;
-      }
-
-      saveConfig(config);
-      sendJSON(res, 201, { ok: true, message: `Provider '${name}' created.` });
-    } catch (e) {
-      sendJSON(res, 400, { ok: false, error: e.message });
-    }
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // PUT /api/providers/:name — Update a provider
-  // Body: { url?, apiKey?, defaultModel? }
-  // ----------------------------------------------------------
-  const putMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)$/);
-  if (putMatch && method === 'PUT') {
-    try {
-      const name = putMatch[1];
-      const body = await parseBody(req);
-      const config = loadConfig();
-
-      if (!config.providers[name]) {
-        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
-        return true;
-      }
-
-      if (body.url !== undefined) config.providers[name].url = body.url;
-      if (body.apiKey !== undefined) config.providers[name].apiKey = body.apiKey;
-      if (body.defaultModel !== undefined) config.providers[name].defaultModel = body.defaultModel;
-      if (body.models !== undefined) config.providers[name].models = body.models;
-
-      saveConfig(config);
-      sendJSON(res, 200, { ok: true, message: `Provider '${name}' updated.` });
-    } catch (e) {
-      sendJSON(res, 400, { ok: false, error: e.message });
-    }
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // DELETE /api/providers/:name — Remove a provider
-  // ----------------------------------------------------------
-  const deleteMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)$/);
-  if (deleteMatch && method === 'DELETE') {
-    const name = deleteMatch[1];
-    const config = loadConfig();
-
-    if (!config.providers[name]) {
-      sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
-      return true;
-    }
-
-    delete config.providers[name];
-
-    // If we deleted the active provider, clear or reassign
-    if (config.active_provider === name) {
-      const remaining = Object.keys(config.providers);
-      config.active_provider = remaining.length > 0 ? remaining[0] : null;
-    }
-
-    saveConfig(config);
-    sendJSON(res, 200, { ok: true, message: `Provider '${name}' deleted.` });
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // POST /api/providers/:name/activate — Switch active provider
-  // ----------------------------------------------------------
-  const activateMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/activate$/);
-  if (activateMatch && method === 'POST') {
-    const name = activateMatch[1];
-    const config = loadConfig();
-
-    if (!config.providers[name]) {
-      sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
-      return true;
-    }
-
-    config.active_provider = name;
-    saveConfig(config);
-    sendJSON(res, 200, { ok: true, message: `Active provider switched to '${name}'.` });
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // POST /api/providers/:name/model — Switch active model for a provider
-  // Body: { model: "model-name" }
-  // ----------------------------------------------------------
-  const modelMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/model$/);
-  if (modelMatch && method === 'POST') {
-    try {
-      const name = modelMatch[1];
-      const body = await parseBody(req);
-      const config = loadConfig();
-
-      if (!config.providers[name]) {
-        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
-        return true;
-      }
-
-      if (!body.model) {
-        sendJSON(res, 400, { ok: false, error: 'Missing required field: model' });
-        return true;
-      }
-
-      // Ensure models array exists
-      if (!config.providers[name].models) {
-        config.providers[name].models = [];
-      }
-
-      // Add to models list if not already there
-      if (!config.providers[name].models.includes(body.model)) {
-        config.providers[name].models.push(body.model);
-      }
-
-      config.providers[name].defaultModel = body.model;
-      saveConfig(config);
-      sendJSON(res, 200, { ok: true, message: `Model switched to '${body.model}' for provider '${name}'.` });
-    } catch (e) {
-      sendJSON(res, 400, { ok: false, error: e.message });
-    }
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // POST /api/providers/:name/models/add — Add a model to a provider's list
-  // Body: { model: "model-name" }
-  // ----------------------------------------------------------
-  const addModelMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/models\/add$/);
-  if (addModelMatch && method === 'POST') {
-    try {
-      const name = addModelMatch[1];
-      const body = await parseBody(req);
-      const config = loadConfig();
-
-      if (!config.providers[name]) {
-        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
-        return true;
-      }
-
-      if (!body.model) {
-        sendJSON(res, 400, { ok: false, error: 'Missing required field: model' });
-        return true;
-      }
-
-      if (!config.providers[name].models) {
-        config.providers[name].models = [];
-      }
-
-      if (config.providers[name].models.includes(body.model)) {
-        sendJSON(res, 409, { ok: false, error: `Model '${body.model}' already exists.` });
-        return true;
-      }
-
-      config.providers[name].models.push(body.model);
-
-      // If no default model is set, make this the default
-      if (!config.providers[name].defaultModel) {
-        config.providers[name].defaultModel = body.model;
-      }
-
-      saveConfig(config);
-      sendJSON(res, 201, { ok: true, message: `Model '${body.model}' added to '${name}'.` });
-    } catch (e) {
-      sendJSON(res, 400, { ok: false, error: e.message });
-    }
-    return true;
-  }
-
-  // ----------------------------------------------------------
-  // POST /api/providers/:name/models/remove — Remove a model from a provider's list
-  // Body: { model: "model-name" }
-  // ----------------------------------------------------------
-  const removeModelMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/models\/remove$/);
-  if (removeModelMatch && method === 'POST') {
-    try {
-      const name = removeModelMatch[1];
-      const body = await parseBody(req);
-      const config = loadConfig();
-
-      if (!config.providers[name]) {
-        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
-        return true;
-      }
-
-      if (!body.model) {
-        sendJSON(res, 400, { ok: false, error: 'Missing required field: model' });
-        return true;
-      }
-
-      if (!config.providers[name].models) {
-        config.providers[name].models = [];
-      }
-
-      config.providers[name].models = config.providers[name].models.filter(m => m !== body.model);
-
-      // If we removed the active model, clear or switch to first available
-      if (config.providers[name].defaultModel === body.model) {
-        config.providers[name].defaultModel = config.providers[name].models[0] || '';
-      }
-
-      saveConfig(config);
-      sendJSON(res, 200, { ok: true, message: `Model '${body.model}' removed from '${name}'.` });
-    } catch (e) {
-      sendJSON(res, 400, { ok: false, error: e.message });
-    }
-    return true;
-  }
-
-  // No matching API route
-  return false;
+  sendJSON(res, 404, { ok: false, error: `Unknown API route: ${routePath}` });
+  return true;
 }

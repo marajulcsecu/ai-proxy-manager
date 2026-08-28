@@ -1,15 +1,58 @@
 {
   "name": "ai-proxy-manager",
-  "version": "1.0.0",
-  "description": "A smart local AI proxy manager for routing requests to multiple providers.",
-  "main": "src/index.js",
+  "version": "1.1.0",
+  "description": "A local smart-router daemon that points AI coding tools at any Anthropic-compatible API provider, with a CLI and a web dashboard.",
+  "keywords": [
+    "ai",
+    "proxy",
+    "reverse-proxy",
+    "anthropic",
+    "claude",
+    "claude-code",
+    "openai",
+    "ollama",
+    "llm",
+    "router",
+    "gateway",
+    "cli",
+    "dashboard",
+    "daemon"
+  ],
+  "homepage": "https://github.com/marajulcsecu/ai-proxy-manager#readme",
+  "bugs": {
+    "url": "https://github.com/marajulcsecu/ai-proxy-manager/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marajulcsecu/ai-proxy-manager.git"
+  },
+  "license": "MIT",
+  "author": "MD. MARAJUL HAQUE",
   "type": "module",
+  "main": "src/index.js",
   "bin": {
     "ai-proxy": "./src/cli.js"
   },
-  "scripts": {
-    "start": "node src/index.js"
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.17"
   },
-  "author": "Marajul",
-  "license": "MIT"
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "scripts": {
+    "start": "node src/cli.js start",
+    "dashboard": "node src/cli.js start",
+    "test": "node --test tests/",
+    "check:secrets": "./scripts/check-secrets.sh",
+    "check:syntax": "find src tests -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "verify": "npm run check:syntax && npm test && npm run check:secrets"
+  }
 }
