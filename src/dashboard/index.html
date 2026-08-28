@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Proxy Manager</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- ===== HEADER ===== -->
+  <header class="header">
+    <div class="header-left">
+      <h1 class="logo">⚡ AI Proxy Manager</h1>
+    </div>
+    <div class="header-right">
+      <span id="status-badge" class="badge badge-offline">● Connecting...</span>
+      <span id="uptime" class="meta-text"></span>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- ===== STATS BAR ===== -->
+    <section class="stats-bar">
+      <div class="stat-card">
+        <span class="stat-value" id="stat-active">—</span>
+        <span class="stat-label">Active Provider</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-value" id="stat-providers">0</span>
+        <span class="stat-label">Providers</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-value" id="stat-requests">0</span>
+        <span class="stat-label">Requests Routed</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-value" id="stat-uptime">0s</span>
+        <span class="stat-label">Uptime</span>
+      </div>
+    </section>
+
+    <!-- ===== PROVIDER SECTION ===== -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Providers</h2>
+        <button class="btn btn-primary" onclick="openModal()">+ Add Provider</button>
+      </div>
+      <div class="provider-grid" id="provider-grid">
+        <!-- Provider cards rendered dynamically -->
+      </div>
+    </section>
+
+    <!-- ===== LIVE LOG SECTION ===== -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Live Request Log</h2>
+        <span class="meta-text" id="log-count">0 entries</span>
+      </div>
+      <div class="log-container" id="log-container">
+        <div class="log-empty" id="log-empty">No requests yet. Waiting for traffic...</div>
+        <table class="log-table" id="log-table" style="display:none;">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Time</th>
+              <th>Method</th>
+              <th>Provider</th>
+              <th>Model</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="log-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===== CLAUDE CODE SETUP ===== -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Claude Code Setup</h2>
+      </div>
+      <div class="setup-box">
+        <p>To connect Claude Code to this proxy, run these commands in your terminal:</p>
+        <pre class="code-block">
+# Step 1: Set environment variables (one-time)
+ai-proxy setup-terminal
+
+# Step 2: Reload your shell
+source ~/.bashrc
+
+# Step 3: Start Claude Code
+claude</pre>
+        <p class="meta-text">The proxy must be running (<code>ai-proxy start</code>) before launching Claude Code.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- ===== ADD/EDIT PROVIDER MODAL ===== -->
+  <div class="modal-overlay" id="modal-overlay" onclick="closeModal()">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3 id="modal-title">Add Provider</h3>
+        <button class="btn-close" onclick="closeModal()">&times;</button>
+      </div>
+      <form id="provider-form" onsubmit="submitProvider(event)">
+        <input type="hidden" id="form-editing" value="">
+        <div class="form-group">
+          <label for="form-name">Provider Name</label>
+          <input type="text" id="form-name" placeholder="e.g. tabitoken" required>
+        </div>
+        <div class="form-group">
+          <label for="form-url">Base URL</label>
+          <input type="url" id="form-url" placeholder="https://tabitoken.com/v1" required>
+        </div>
+        <div class="form-group">
+          <label for="form-key">API Key</label>
+          <input type="password" id="form-key" placeholder="sk-...">
+        </div>
+        <div class="form-group">
+          <label for="form-model">Default Model <span class="meta-text">(leave empty for pass-through)</span></label>
+          <input type="text" id="form-model" placeholder="e.g. claude-opus-5-thinking">
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="form-submit-btn">Add Provider</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===== TOAST NOTIFICATION ===== -->
+  <div class="toast" id="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
