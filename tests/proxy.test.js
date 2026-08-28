@@ -11,6 +11,8 @@ import http from 'node:http';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-proxy-proxy-'));
 process.env.AI_PROXY_HOME = home;
+// The server shares stdout with the test reporter; keep it quiet.
+process.env.AI_PROXY_QUIET = '1';
 
 const { saveConfig, clearConfigCache } = await import('../src/core/configManager.js');
 const { startProxyServer } = await import('../src/core/proxyServer.js');
@@ -88,10 +90,25 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise(resolve => proxy.close(resolve));
-  await new Promise(resolve => upstream.close(resolve));
+  // The stall tests deliberately leave a response open, and fetch() keeps its
+  // sockets alive, so close() alone can wait indefinitely.
+  await shutdown(proxy);
+  await shutdown(upstream);
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+/**
+ * Closes a server without waiting on lingering keep-alive or stalled sockets.
+ * @param {import('http').Server} server
+ * @returns {Promise<void>}
+ */
+function shutdown(server) {
+  return new Promise(resolve => {
+    server.close(() => resolve());
+    server.closeAllConnections?.();
+    setTimeout(resolve, 2000).unref();
+  });
+}
 
 /** Raw request, so forbidden headers such as Host can be set. */
 function rawRequest(pathname, headers = {}) {

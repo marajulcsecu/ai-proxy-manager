@@ -10,6 +10,8 @@ import path from 'node:path';
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-proxy-api-'));
 process.env.AI_PROXY_HOME = home;
+// The server shares stdout with the test reporter; keep it quiet.
+process.env.AI_PROXY_QUIET = '1';
 
 const { saveConfig, loadConfig } = await import('../src/core/configManager.js');
 const { startProxyServer } = await import('../src/core/proxyServer.js');
@@ -24,7 +26,12 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise(resolve => server.close(resolve));
+  // fetch() holds keep-alive sockets open, which server.close() waits for.
+  await new Promise(resolve => {
+    server.close(() => resolve());
+    server.closeAllConnections?.();
+    setTimeout(resolve, 2000).unref();
+  });
   fs.rmSync(home, { recursive: true, force: true });
 });
 

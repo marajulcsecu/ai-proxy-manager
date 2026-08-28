@@ -7,13 +7,25 @@
 
 const useColor = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
 
+/**
+ * Suppresses all output. Set AI_PROXY_QUIET=1 when embedding the server in a
+ * process that owns stdout itself — the test runner, for instance, whose report
+ * shares the channel.
+ */
+const quiet = process.env.AI_PROXY_QUIET === '1';
+
 const paint = (code, text) => (useColor ? `\x1b[${code}m${text}\x1b[0m` : text);
 
 /** True when running detached, where a timestamp per line is worth the noise. */
 const stamped = process.env.AI_PROXY_DAEMONIZED === '1';
 const prefix = () => (stamped ? `${new Date().toISOString()} ` : '');
 
-export const Logger = {
+const noop = () => {};
+
+export const Logger = quiet ? {
+  success: noop, error: noop, info: noop, warn: noop, plain: noop,
+  header: noop, dim: noop, value: text => text, divider: noop
+} : {
   success: msg => console.log(`${prefix()}${paint(32, '✔')} ${msg}`),
   error: msg => console.error(`${prefix()}${paint(31, '✖')} ${msg}`),
   info: msg => console.log(`${prefix()}${paint(34, 'ℹ')} ${msg}`),
