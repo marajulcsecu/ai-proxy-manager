@@ -1,425 +1,356 @@
 # AI Proxy Manager — Developer & Agent Context
 
 > **Read this first** if you are a new developer or AI agent working on this project.
-> This document contains everything you need to understand, modify, and extend the tool.
+> Last verified against the code on 2026-08-28 (v1.1.0).
 
 ---
 
-## Table of Contents
+## 1. What this is
 
-1. [What Is This?](#what-is-this)
-2. [Architecture Overview](#architecture-overview)
-3. [File Structure](#file-structure)
-4. [Configuration](#configuration)
-5. [How The Proxy Works](#how-the-proxy-works)
-6. [REST API Reference](#rest-api-reference)
-7. [CLI Commands](#cli-commands)
-8. [Web Dashboard](#web-dashboard)
-9. [Integration Points](#integration-points)
-10. [Known Issues & Constraints](#known-issues--constraints)
-11. [Development Guide](#development-guide)
-12. [Security Notes](#security-notes)
-13. [Commit History & Design Decisions](#commit-history--design-decisions)
+A **local reverse proxy** between AI coding tools (Claude Code, VS Code Copilot, …) and
+third-party Anthropic-compatible API providers (Tabitoken, GoRouter, SeekAI, …).
 
----
+It solves four problems:
 
-## What Is This?
+| Problem | How this solves it |
+|:---|:---|
+| Tools hardcode `api.anthropic.com` | They talk to `127.0.0.1:8319` instead; the proxy forwards |
+| Juggling keys, URLs and model names | One JSON config, switchable from CLI or dashboard without a restart |
+| Some providers block non-SDK traffic | Requests carry first-party SDK headers upstream |
+| No visibility into what is happening | Live dashboard with request history, latency and per-provider tests |
 
-AI Proxy Manager is a **local reverse proxy** that sits between AI coding tools (Claude Code, VS Code Copilot, etc.) and third-party AI API providers (Tabitoken, GoRouter, SeekAI, etc.).
+**Tech stack:** Node.js ≥18.17, zero npm dependencies, vanilla HTML/CSS/JS dashboard,
+tests on the built-in `node:test` runner.
 
-**The problem it solves:**
-- AI tools like Claude Code hardcode their API base URL to `api.anthropic.com`
-- Users who use third-party providers need a way to redirect traffic
-- Managing multiple providers, API keys, and models is tedious
-- Some providers (e.g., Tabitoken) block direct `curl` requests via Cloudflare WAF
+**The rest of the doc set:** [API.md](API.md) (REST reference with examples) ·
+[DASHBOARD.md](DASHBOARD.md) (the client, and the rules for editing it) ·
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) · [SETUP_GUIDE.md](SETUP_GUIDE.md) ·
+[SRS.md](SRS.md) · [ROADMAP.md](ROADMAP.md) ·
+[../CONTRIBUTING.md](../CONTRIBUTING.md) · [../SECURITY.md](../SECURITY.md) ·
+[../CHANGELOG.md](../CHANGELOG.md)
 
-**What it does:**
-- Runs a local HTTP server on `http://127.0.0.1:8319`
-- Intercepts API requests and forwards them to the configured upstream provider
-- Rewrites API keys, model names, and headers transparently
-- Spoofs request headers to bypass Cloudflare WAF blocks
-- Provides a web dashboard for visual management
-- Supports multiple providers with instant switching
-- Supports multiple models per provider
-
-**Tech stack:** Pure Node.js (zero npm dependencies), vanilla HTML/CSS/JS dashboard.
+> ⚠️ **If you are an agent working in this repo:** the daemon on port 8319 may be routing
+> the traffic of the very session you are running in. Never `ai-proxy stop`/`restart` or
+> kill that port. Test with `AI_PROXY_HOME=/tmp/whatever ai-proxy start --daemon --port 8321`.
 
 ---
 
-## Architecture Overview
+## 2. Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  Claude Code / VS Code                  │
-│            sends requests to 127.0.0.1:8319             │
-└────────────────────────┬────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│              Node.js HTTP Server (:8319)                 │
-│                                                         │
-│  Layer 1: Dashboard    │  GET /              → HTML     │
-│                        │  GET /style.css     → CSS      │
-│                        │  GET /app.js        → JS       │
-│  ──────────────────────┼──────────────────────────────  │
-│  Layer 2: REST API     │  /api/providers     → CRUD     │
-│                        │  /api/status        → Health   │
-│                        │  /api/logs          → Logs     │
-│  ──────────────────────┼──────────────────────────────  │
-│  Layer 3: Proxy Engine │  /v1/messages       → Forward  │
-│                        │  /v1/chat/*         → Forward  │
-│                        │  HEAD /             → Forward  │
-└────────────────────────┼────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│         Upstream Provider (e.g., tabitoken.com)          │
-│         HTTPS :443 with spoofed headers                  │
-└─────────────────────────────────────────────────────────┘
+ Claude Code / VS Code / curl
+            │  http://127.0.0.1:8319
+            ▼
+┌──────────────────────────────────────────────────────────────┐
+│                  http.Server (one port)                      │
+│                                                              │
+│  1. Dashboard   "/", /style.css, /app.js, /favicon.svg       │
+│  2. REST API    /api/*                                       │
+│  3. Proxy       everything else → upstream provider           │
+│                                                              │
+│  Layers 1 and 2 are localhost-only (Host/Origin checked).    │
+└───────────────────────────┬──────────────────────────────────┘
+                            ▼
+        provider.url  (http or https, any port, any base path)
 ```
 
-Request routing priority:
-1. `/` or `/index.html` or static files → **Dashboard** (serve HTML/CSS/JS)
-2. `/api/*` → **REST API** (provider management, status, logs)
-3. Everything else → **Proxy Engine** (forward to upstream provider)
+Routing is decided on the **pathname only**, so `?query=strings` never leak into the
+proxy layer.
 
----
-
-## File Structure
+### Module map
 
 ```
-ai-proxy-manager/
-├── package.json                          # type:module, bin:"ai-proxy", zero deps
-├── README.md                             # User-facing tutorial
+src/
+├── cli.js                      Argument parsing → controllers. Only place that exits.
+├── index.js                    Re-exports for programmatic use.
 │
-├── docs/
-│   ├── CONTEXT.md                        # ← THIS FILE (developer/agent reference)
-│   ├── SRS.md                            # System Requirements Specification
-│   ├── ROADMAP.md                        # Phase-based development roadmap
-│   ├── SETUP_GUIDE.md                    # Step-by-step provider setup guide
-│   └── DASHBOARD_PLAN.md                 # Dashboard implementation plan
+├── core/
+│   ├── paths.js                Every on-disk path. Honours $AI_PROXY_HOME.
+│   ├── configManager.js        load/save/normalize config. Atomic writes, mtime cache.
+│   ├── upstream.js             provider URL + request path → concrete target.
+│   ├── headers.js              Header spoofing, hop-by-hop stripping, auth injection.
+│   ├── proxyServer.js          The server: 3-layer routing, streaming, timeouts.
+│   ├── apiRoutes.js            REST API (table-driven router).
+│   ├── requestLogger.js        Ring buffer + metrics + JSONL mirror.
+│   ├── providerTester.js       One real request to a provider, mapped to a verdict.
+│   ├── daemon.js               PID file, start/stop/status, log tailing.
+│   └── runtime.js              Facts about the running process (the bound port).
 │
-└── src/
-    ├── cli.js                            # CLI entry point (#!/usr/bin/env node)
-    ├── index.js                          # Module re-exports
-    │
-    ├── core/
-    │   ├── configManager.js              # loadConfig() / saveConfig() → config.json
-    │   ├── proxyServer.js                # HTTP server with 3-layer routing
-    │   ├── apiRoutes.js                  # REST API handler (/api/*)
-    │   └── requestLogger.js              # In-memory circular buffer (50 entries)
-    │
-    ├── controllers/
-    │   ├── providerController.js         # addProvider, setKey, setModel, addModel, etc.
-    │   └── integrationController.js      # syncVsCode(), setupTerminal()
-    │
-    ├── dashboard/
-    │   ├── index.html                    # Single-page dashboard
-    │   ├── style.css                     # Dark theme (GitHub-inspired)
-    │   └── app.js                        # Client-side polling & rendering
-    │
-    └── utils/
-        └── logger.js                     # Color-coded console output utility
+├── controllers/
+│   ├── providerController.js   Provider/model CRUD used by the CLI.
+│   └── integrationController.js Shell rc + VS Code integration (idempotent blocks).
+│
+├── utils/
+│   ├── logger.js               Console output; colour only on a TTY.
+│   ├── version.js              Reads package.json once.
+│   └── errors.js               UsageError (CLI exit code 1).
+│
+└── dashboard/                  index.html · style.css · app.js · favicon.svg
 ```
 
 ---
 
-## Configuration
+## 3. Configuration
 
-**Config file location:** `~/.config/ai-proxy-manager/config.json`
-
-**Schema:**
+**Location:** `~/.config/ai-proxy-manager/config.json` — or `$AI_PROXY_HOME/config.json`
+when that variable is set (used by the tests so they never touch real data).
 
 ```json
 {
   "providers": {
-    "<provider-name>": {
-      "url": "string",           // Base URL (e.g., "https://tabitoken.com/v1")
-      "apiKey": "string",        // API key (e.g., "sk-...")
-      "defaultModel": "string",  // Currently active model (e.g., "claude-opus-5-thinking")
-      "models": ["string"]       // Optional. List of available models for this provider
+    "tabitoken": {
+      "url": "https://tabitoken.com/v1",
+      "apiKey": "sk-…",
+      "defaultModel": "claude-opus-5-thinking",
+      "models": ["claude-opus-5-thinking", "claude-sonnet-5"]
     }
   },
-  "active_provider": "string",   // Name of the currently active provider
-  "proxy_port": 8319             // Port the proxy listens on
+  "active_provider": "tabitoken",
+  "proxy_port": 8319,
+  "settings": {
+    "upstreamTimeoutMs": 900000,
+    "upstreamStallTimeoutMs": 300000,
+    "spoofHeaders": true,
+    "persistLogs": true,
+    "logBufferSize": 200,
+    "captureBodies": true,
+    "theme": "system"
+  }
 }
 ```
 
-**Important notes:**
-- Config is read from disk on EVERY incoming request (no caching). This allows instant provider/model switching without restarting the server.
-- The `models` array is optional for backward compatibility. Older providers that were created before the multi-model feature won't have it — the code handles this gracefully with `provider.models || []`.
-- If `defaultModel` is empty or missing, the proxy uses **pass-through mode** — it does NOT rewrite the model field, forwarding whatever the client originally sent.
+Rules enforced by `normalizeConfig()` on every read (and written back once by
+`migrateConfig()` at start-up):
+
+- Provider names are lowercased and stripped to `[a-z0-9._-]`.
+- `models` is deduplicated, and `defaultModel` is always present in it.
+  *(A `defaultModel` missing from `models` used to make the dashboard dropdown display
+  the wrong model as selected.)*
+- `active_provider` must exist; otherwise it falls back to the first provider or `null`.
+- `proxy_port` must be 1–65535; `logBufferSize` is clamped to 10–5000; `theme` to
+  `system|light|dark`.
+
+**An empty `defaultModel` means pass-through** — the client's requested model is forwarded
+unchanged.
+
+Other files in the same directory:
+
+| File | Purpose |
+|:---|:---|
+| `daemon.pid` | JSON `{pid, port, startedAt}`; drives `stop`/`status`/`restart` |
+| `daemon.log` | stdout/stderr of a backgrounded daemon; `ai-proxy logs` tails it |
+| `requests.jsonl` | Request **metadata** history, rotated at 5 MB. Never contains bodies |
+
+The config file is written atomically (temp file + rename) with mode `0600`, and the
+directory with `0700`, because it holds API keys.
 
 ---
 
-## How The Proxy Works
+## 4. How a proxied request flows
 
-### Request Flow (step by step)
+`POST http://127.0.0.1:8319/v1/messages`
 
-When Claude Code sends `POST http://127.0.0.1:8319/v1/messages`:
+1. **Split** the URL into pathname + query. Dashboard assets and `/api/*` are handled
+   first; everything else is proxied.
+2. **Load config** (`tryLoadConfig()` — cached by mtime, never throws on the request path,
+   so a corrupt file returns a 500 instead of killing the daemon).
+3. **Extract the token** from `Authorization: Bearer …`, `x-api-key` or `api-key`.
+4. **Route** (`resolveRoute`): a `provider:key` token targets that provider explicitly;
+   anything else uses `active_provider`. A key containing `dummy`, or shorter than 16
+   characters, is replaced by the stored key.
+5. **Resolve the target** (`resolveUpstream`): scheme, host, port and base path all come
+   from `provider.url`, so `http://127.0.0.1:11434/v1` (Ollama) and
+   `https://host/openai/v1` (path-prefixed gateway) both work. The API version segment is
+   never duplicated.
+6. **Build headers** (`buildUpstreamHeaders`): drop hop-by-hop headers and the client's
+   auth, apply `SPOOFED_HEADERS` (unless `spoofHeaders` is off), set `Host`, then set
+   **both** `Authorization: Bearer <key>` and `x-api-key: <key>`.
+7. **Rewrite the model** — only for `POST` to a model-bearing path (`/messages`,
+   `/chat/completions`, `/completions`, `/responses`, `/embeddings`,
+   `/messages/count_tokens`) and only when `defaultModel` is set. A body that is not JSON
+   is forwarded untouched rather than rejected. Other paths stream straight through
+   without buffering.
+8. **Forward and stream back**, preserving SSE. Two timers protect the client:
+   `upstreamTimeoutMs` (hard ceiling) and `upstreamStallTimeoutMs` (socket inactivity →
+   the "answers 200 then goes silent forever" failure mode). A client disconnect destroys
+   the upstream request.
+9. **Log** id, timestamps, provider, model swap, status, duration, TTFB, byte counts,
+   streaming flag and any error.
 
-1. **Read config** — `loadConfig()` reads `config.json` from disk (every request).
-2. **Extract token** — Reads `Authorization: Bearer <token>` or `x-api-key` header.
-3. **Smart routing** — If token is `providerName:apiKey` format (e.g., `tabitoken:sk-123`), route to that specific provider. Otherwise, route to `active_provider`.
-4. **Resolve API key** — If the token contains `"dummy"` or is too short (< 15 chars), replace it with the stored `apiKey` from config. Otherwise, pass the client's key through.
-5. **Build outgoing request** — Target: `https://<provider-host>:443`. Apply spoofed headers.
-6. **Inject auth headers** — ALWAYS sets BOTH `Authorization: Bearer <key>` AND `x-api-key: <key>` for maximum provider compatibility.
-7. **Model rewriting** (POST `/messages` only) — If `defaultModel` is set, replace the `model` field in the JSON body. If empty, pass through.
-8. **Forward & stream** — Pipe the response back to the client (supports SSE streaming).
-9. **Log** — Record the request in the in-memory circular buffer.
+Failures return an Anthropic-shaped envelope so client tools display them:
 
-### Spoofed Headers
-
-Some providers (Tabitoken) use Cloudflare WAF that blocks direct API requests. The proxy spoofs these headers to bypass it:
-
-```javascript
-const SPOOFED_HEADERS = {
-  'user-agent': 'codex_cli_rs/0.101.0',
-  'anthropic-version': '2023-06-01',
-  'x-stainless-lang': 'js',
-  'x-stainless-package-version': '0.24.0',
-  'x-stainless-os': 'linux',
-  'x-stainless-arch': 'x64',
-  'x-stainless-runtime': 'node',
-  'x-stainless-runtime-version': 'v20.0.0'
-};
+```json
+{ "type": "error", "error": { "type": "upstream_unreachable", "message": "…" } }
 ```
 
-**Location:** `src/core/proxyServer.js` lines 21-30.
-
-### Dual Header Injection
-
-The proxy always sends BOTH:
-- `Authorization: Bearer <key>` — Required by Tabitoken, GoRouter
-- `x-api-key: <key>` — Required by official Anthropic SDK
-
-This ensures compatibility across all providers without per-provider configuration.
+`type` is one of `proxy_error`, `config_error`, `not_configured`,
+`authentication_error`, `upstream_unreachable`, `timeout`, `invalid_request_error`.
 
 ---
 
-## REST API Reference
+## 5. REST API
 
-All endpoints return JSON. All endpoints accept `Content-Type: application/json`.
+Full reference with request and response examples: **[API.md](API.md)**. Summary:
 
-### Provider Management
+Localhost only: a request whose `Host` or `Origin` is not a loopback name gets `403`.
+There is no CORS wildcard — that combination is what stops any website you visit from
+reading your API keys out of `127.0.0.1:8319` via DNS rebinding.
 
-| Method | Endpoint | Body | Description |
-|:---|:---|:---|:---|
-| `GET` | `/api/providers` | — | List all providers (name, url, models, hasKey, isActive) |
-| `POST` | `/api/providers` | `{ name, url, apiKey?, defaultModel?, models? }` | Create a new provider |
-| `PUT` | `/api/providers/:name` | `{ url?, apiKey?, defaultModel?, models? }` | Update provider fields |
-| `DELETE` | `/api/providers/:name` | — | Delete a provider |
-| `POST` | `/api/providers/:name/activate` | — | Set as active provider |
-
-### Model Management
-
-| Method | Endpoint | Body | Description |
-|:---|:---|:---|:---|
-| `POST` | `/api/providers/:name/model` | `{ model }` | Switch active model (also adds to models list if new) |
-| `POST` | `/api/providers/:name/models/add` | `{ model }` | Add a model to the provider's list |
-| `POST` | `/api/providers/:name/models/remove` | `{ model }` | Remove a model from the provider's list |
-
-### Status & Logs
-
-| Method | Endpoint | Description |
+| Method | Endpoint | Notes |
 |:---|:---|:---|
-| `GET` | `/api/status` | Returns `{ ok, activeProvider, providerCount, totalRequests, uptimeSeconds }` |
-| `GET` | `/api/logs` | Returns `{ ok, logs: [...] }` — last 50 proxied requests |
+| `GET` | `/api/meta` | version, node, pid, config path, bound port, daemon state |
+| `GET` | `/api/status` | active provider, counts, p50/p95, error rate, uptime |
+| `GET` | `/api/providers` | list; keys are masked (`keyPreview`), never returned raw |
+| `POST` | `/api/providers` | `{name, url, apiKey?, defaultModel?, models?}` → 409 if it exists |
+| `GET`·`PUT`·`DELETE` | `/api/providers/:name` | PUT with no `apiKey` keeps the stored key; `clearKey:true` erases it |
+| `POST` | `/api/providers/:name/activate` | |
+| `GET` | `/api/providers/:name/key` | the one endpoint that returns a key in clear |
+| `POST` | `/api/providers/:name/test` | one real upstream request; `{model?}` |
+| `POST` | `/api/providers/:name/model` | `{model}`; `""` restores pass-through |
+| `POST` | `/api/providers/:name/models` | add (`/models/add` kept as an alias) |
+| `DELETE` | `/api/providers/:name/models/:model` | URL-encode the model; `POST /models/remove` also works |
+| `GET` | `/api/logs` | `?limit=&provider=&status=ok\|error\|pending` |
+| `GET` | `/api/logs/:id` | one request plus in-memory body previews |
+| `DELETE` | `/api/logs` | clear history and truncate the JSONL file |
+| `GET`·`PUT` | `/api/settings` | PUT reports `restartRequired` when the port changed |
+| `GET` | `/api/config/export` | `?redact=0` to include keys |
+| `POST` | `/api/config/import` | `{config, mode:'merge'\|'replace'}`; an empty key never overwrites a stored one |
+| `GET` | `/api/integrations` | whether the shell block and VS Code list are applied |
+| `POST`·`DELETE` | `/api/integrations/shell` | write / remove the managed rc block |
+| `POST` | `/api/integrations/vscode` | sync the model list |
 
-### Response Format
-
-All responses follow: `{ ok: true/false, message?: string, error?: string, ... }`
+Every response is `{ok: boolean, …}`. Unknown routes return `404`; a known path with the
+wrong method returns `405` plus the allowed methods.
 
 ---
 
-## CLI Commands
-
-The tool is globally installed as `ai-proxy` (via `npm link`).
+## 6. CLI
 
 ```
-ai-proxy list                              Show all registered providers
-ai-proxy add-provider <name> <url>         Register a new AI provider
-ai-proxy set-key <name> <api-key>          Set the API key for a provider
-ai-proxy set-model <name> <model-name>     Set the default model for a provider
-ai-proxy add-model <name> <model-name>     Add a model to a provider's list
-ai-proxy remove-model <name> <model-name>  Remove a model from a provider's list
-ai-proxy use <name>                        Set a provider as the active default
-ai-proxy start                             Start the Smart Proxy Server + Dashboard
-ai-proxy sync-vscode                       Inject providers into VS Code GUI
-ai-proxy setup-terminal                    Configure ~/.bashrc for Claude Code
-ai-proxy help                              Show help text
+Providers     list · add-provider <name> <url> · remove-provider <name> · set-key <name> <key>
+              use <name> · test [name] [--model <id>]
+Models        set-model <name> <model|""> · add-model <name> <model> · remove-model <name> <model>
+Daemon        start [--daemon] [--port n] · stop · restart · status · logs [-n N] [-f] · set-port <n>
+Integrations  setup-terminal · remove-terminal · sync-vscode
+Config        export <file> [--with-keys] · import <file> [--replace] · help · version
 ```
 
----
-
-## Web Dashboard
-
-**URL:** `http://127.0.0.1:8319` (served by the same proxy server)
-
-### Sections:
-1. **Stats Bar** — Active provider, provider count, total requests, uptime
-2. **Provider Cards** — Visual grid with:
-   - Model dropdown (switch models instantly)
-   - Model tags with ✕ delete buttons
-   - "⚡ Use This" / "✏️ Edit" / "+ Model" / "🗑️" actions
-3. **Add Provider Modal** — Form: name, URL, API key, default model
-4. **Add Model Modal** — Quick-add a model to any provider
-5. **Live Request Log** — Auto-updating table of proxied requests
-6. **Claude Code Setup** — Instructions for terminal configuration
-
-### Technical Details:
-- **Polling:** Dashboard polls `/api/status`, `/api/providers`, and `/api/logs` every 2 seconds.
-- **No WebSocket:** MVP uses simple polling. Can upgrade to WebSocket/SSE later.
-- **Zero dependencies:** Pure vanilla HTML/CSS/JS, no build tools.
-- **Provider data cache:** Provider data is stored in `providersCache` JS variable — edit buttons reference data from this cache, NOT from inline onclick attributes (this avoids HTML attribute escaping issues).
+- `start` runs in the foreground; `--daemon` detaches and writes `daemon.pid`.
+  Either way `ai-proxy stop` finds it.
+- `status` prints daemon state, active route, provider counts, live traffic (fetched from
+  `/api/status`) and whether each integration is applied.
+- Commands throw `UsageError`; `cli.js` is the only place that sets the exit code.
 
 ---
 
-## Integration Points
+## 7. Dashboard
 
-### Claude Code (Primary Target)
+`http://127.0.0.1:8319` — five views (Overview, Providers, Requests, Setup, Settings) in
+one page, no build step, no framework. Screenshots and a per-view tour:
+**[DASHBOARD.md](DASHBOARD.md)**.
 
-Claude Code reads `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` environment variables.
+Conventions to preserve when editing `dashboard/app.js`:
 
-The `ai-proxy setup-terminal` command injects this into `~/.bashrc`:
+- **No inline `onclick`.** Everything is delegated from `document` via `data-action`
+  attributes mapped in the `ACTIONS` table. Two historical bugs came from quoting values
+  into inline handlers.
+- **Renders are signature-guarded.** Each render function compares a JSON signature of
+  its inputs and returns early when nothing changed, so the 2-second poll cannot steal
+  focus. The provider grid additionally refuses to redraw while a dialog is open or an
+  open `<select>` has focus, and restores focus by `data-focus-key`.
+- **Polling pauses** when `document.hidden`.
+- **Dialogs** go through `showOverlay`/`hideOverlay`: focus trap, Escape, focus restore.
+  `confirmDialog()` replaces `window.confirm`; dismissing it resolves `false` via the
+  `overlay:close` event.
+- **Theme** is `data-theme` on `<html>`, cycled `system → light → dark`, stored in
+  `localStorage` and mirrored into `config.json` so the CLI and other browsers agree.
+- `Ctrl/Cmd+K` opens a command palette built from the current provider list.
+
+---
+
+## 8. Integrations
+
+### Shell (Claude Code)
+
+`setup-terminal` writes a **managed block** to every shell rc file that exists
+(`~/.bashrc`, `~/.zshrc`, `~/.config/fish/config.fish` — fish gets `set -gx` syntax):
+
 ```bash
+# --- AI Proxy Manager (managed block) ---
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8319"
 export ANTHROPIC_AUTH_TOKEN="dummy-key-managed-by-proxy"
+# --- end AI Proxy Manager ---
 ```
 
-Claude Code then sends all requests to the proxy. The proxy resolves the real API key from config (the `"dummy"` token triggers database lookup).
+Re-running rewrites the block in place (so a port change is picked up) instead of
+refusing or appending a second copy. The regex also matches the older hand-written block
+format, so upgrades are clean. `remove-terminal` strips it.
 
-### VS Code (sync-vscode)
+### VS Code
 
-The `ai-proxy sync-vscode` command injects provider blocks into:
-`~/.config/Code/User/chatLanguageModels.json`
-
-Each block uses the `providerName:apiKey` token format which the proxy's smart routing recognizes to route to the correct provider.
-
-### OpenCode
-
-**NOT integrated.** The user explicitly stated OpenCode works directly with provider APIs and doesn't need the proxy.
+`sync-vscode` rewrites `~/.config/Code/User/chatLanguageModels.json`, replacing any
+entry whose `name` starts with `ai-proxy:` and injecting one entry per provider that has
+a key, listing **all** of its models. The `apiKey` is `"<provider>:<real key>"`, which the
+proxy's router uses to target that provider regardless of which one is active.
 
 ---
 
-## Known Issues & Constraints
+## 9. Development
 
-### SeekAI Backend Hangs
-- **Status:** Server-side issue, NOT a proxy bug.
-- **Behavior:** SeekAI returns HTTP 200 + `message_start` + `ping` SSE events, then never sends actual content tokens. The stream hangs indefinitely.
-- **Affected models:** ALL tested models (`claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`, `gpt-5-5`, `deepseek-v4-flash`).
-- **Workaround:** Use a different provider.
-
-### Tabitoken Cloudflare Block
-- Direct `curl` requests to Tabitoken get HTTP 403 ("You have been blocked").
-- The proxy's spoofed headers bypass this. If Cloudflare changes rules, update the `SPOOFED_HEADERS` in `proxyServer.js`.
-
-### Config Read on Every Request
-- `loadConfig()` does `fs.readFileSync()` on every incoming request. This enables instant switching but is not optimal under high load.
-- For the current use case (local single-user proxy), this is fine.
-
-### In-Memory Logs Only
-- Request logs are stored in a circular buffer (max 50) and reset when the server restarts.
-- There is no persistent log storage.
-
-### No Authentication on Dashboard
-- The dashboard is served on localhost only (`127.0.0.1`). No auth is needed.
-- If the proxy is ever exposed to a network, authentication MUST be added.
-
----
-
-## Development Guide
-
-### Prerequisites
-- Node.js v18+ (ES modules support required)
-- No `npm install` needed (zero dependencies)
-
-### Local Setup
 ```bash
-git clone https://github.com/marajulcsecu/ai-proxy-manager.git
-cd ai-proxy-manager
-npm link          # Makes "ai-proxy" available globally
-ai-proxy start    # Launches proxy + dashboard on :8319
+npm link                 # exposes `ai-proxy` globally, no install step
+npm test                 # node:test, 47 tests, no network access needed
+npm run verify           # syntax check + tests + credential scan (what CI runs)
+AI_PROXY_HOME=/tmp/x ai-proxy start --daemon --port 8321   # isolated instance
 ```
 
-### Making Changes
+`scripts/check-secrets.sh` is the credential scanner; install it as a pre-commit hook with
+`ln -sf ../../scripts/check-secrets.sh .git/hooks/pre-commit`. Pass `--all` to sweep every
+commit in history.
 
-1. **Config Manager** (`configManager.js`) — Only modify if changing the config schema.
-2. **Provider Controller** (`providerController.js`) — Add new CLI commands for provider/model management.
-3. **API Routes** (`apiRoutes.js`) — Add new `/api/*` endpoints here. Must return `true` if handled.
-4. **Proxy Server** (`proxyServer.js`) — Core routing logic. Be careful with:
-   - Header injection (lines 130-135)
-   - Model rewriting (lines 153-162)
-   - Spoofed headers (lines 21-30)
-5. **Dashboard** — Pure client-side JS in `dashboard/app.js`. All data comes from polling the REST API.
+**Tests** (`tests/`) each set `AI_PROXY_HOME` to a fresh temp directory *before*
+dynamically importing the modules under test, so they never read or write real config.
 
-### Key Design Patterns
-
-- **Config is the single source of truth.** Both CLI and dashboard modify the same `config.json`. The proxy reads it on every request.
-- **No process restart needed.** Any change to config takes effect on the next request.
-- **Backward compatibility.** New fields (like `models[]`) are optional. Code always handles their absence with `|| []` or similar fallbacks.
-- **Dual interface.** Every operation available in the dashboard is also available via CLI, and vice versa.
-
-### Testing
-
-Currently no automated test suite. Manual testing:
-```bash
-# Start the proxy
-ai-proxy start
-
-# Test API
-curl http://127.0.0.1:8319/api/status
-curl http://127.0.0.1:8319/api/providers
-
-# Test proxy (forwards to active provider)
-curl http://127.0.0.1:8319/v1/messages \
-  -H "Authorization: Bearer dummy" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-opus-5","messages":[{"role":"user","content":"Hi"}]}'
-```
-
----
-
-## Security Notes
-
-> **CRITICAL:** NEVER commit real API keys to the repository.
-
-- A real API key was accidentally committed to `SETUP_GUIDE.md` in an early commit. It exists in git history. The key was revoked.
-- API keys are stored in `~/.config/ai-proxy-manager/config.json` on the local machine only.
-- The dashboard's GET `/api/providers` endpoint does NOT return API keys — only a `hasKey: true/false` flag.
-- The PUT endpoint accepts `apiKey` updates but the dashboard only sends it when the user explicitly enters a new one.
-
----
-
-## Commit History & Design Decisions
-
-| Commit | What & Why |
+| File | Covers |
 |:---|:---|
-| `9e878f3` | Initial modular architecture (configManager + providerController) |
-| `4af2aa4` | Proxy engine + integrations (setupTerminal, syncVsCode) |
-| `7e535aa` | JSDoc syntax error fix + README documentation |
-| `14c5c33` | Setup guide (accidentally included real API key) |
-| `497c34e` | Redacted the leaked API key |
-| `676bbcb` | Added dual auth headers (both `Authorization` + `x-api-key`) — Tabitoken requires `Authorization: Bearer` while Anthropic SDK uses `x-api-key` |
-| `21f3ae3` | Fixed dummy-key parsing — `setup-terminal` generated `dummy-key-managed-by-proxy` but proxy checked for `dummy-token` |
-| `09fd2ae` | Web dashboard MVP — REST API, static file serving, live logs, model pass-through |
-| `61bb8e0` | Multi-model support — `models[]` array per provider, model dropdown, CLI add/remove-model |
-| `8c661fa` | Fixed edit button (JSON double-quotes broke HTML onclick), added model deletion from cards |
+| `config.test.js` | normalization/repair, atomic writes, 0600 mode, cache, corrupt files |
+| `upstream.test.js` | URL parsing, version-segment joining, model-bearing paths |
+| `proxy.test.js` | full request flow against a local fake upstream, incl. stalls and SSE |
+| `api.test.js` | REST contract, validation, export/import, rebinding guard |
+| `requestLogger.test.js` | ring buffer, metrics, persistence, body handling |
 
-### Key Design Decision: Why Single Port?
-
-The dashboard, REST API, and proxy all run on the same port (8319). This was chosen because:
-1. **Zero config for users.** No "start the dashboard on port X and the proxy on port Y".
-2. **Same-origin requests.** The dashboard JS calls `/api/*` endpoints without CORS issues.
-3. **Single process.** One `ai-proxy start` command runs everything.
-
-### Key Design Decision: Why Zero Dependencies?
-
-The entire project uses only Node.js built-in modules (`http`, `https`, `fs`, `path`, `os`). This was chosen because:
-1. **No `npm install` step.** Clone and run.
-2. **No supply chain risk.** No third-party packages to audit.
-3. **Portable.** Works on any system with Node.js 18+.
+When touching the proxy engine, the load-bearing invariants are: config is re-read per
+request; bodies are only buffered for model-bearing POSTs; both auth headers are always
+sent; and every code path either finishes or errors its log entry.
 
 ---
 
-*Last updated: 2026-08-28*
+## 10. Security notes
+
+- `config.json` is `0600` inside a `0700` directory. Never commit it (`.gitignore` covers it).
+- The dashboard and API only answer loopback `Host`/`Origin` values; no CORS wildcard.
+- `GET /api/providers` masks keys. Only `/api/providers/:name/key` returns one, for the
+  dashboard's "reveal" button.
+- Request/response **body previews live in memory only** and are capped at 4 KB. Prompt
+  text is never written to `requests.jsonl`. Turn capture off entirely with
+  `captureBodies: false`.
+- `export` redacts keys unless `--with-keys` / `?redact=0` is passed.
+- A real API key was committed to `docs/SETUP_GUIDE.md` in an early commit and is still in
+  git history. It was revoked.
+
+---
+
+## 11. Known constraints
+
+- **Config is read on every request** (mtime-cached, so usually no disk I/O). This is what
+  makes instant switching work; it is not tuned for high throughput.
+- **A provider that answers 200 and then streams nothing** (observed with SeekAI) is now
+  aborted after `upstreamStallTimeoutMs` with a logged reason instead of hanging forever.
+  It is still a provider-side fault.
+- **Cloudflare-fronted providers** depend on `SPOOFED_HEADERS` in `core/headers.js`. If a
+  provider starts returning 403, that list is what needs updating.
+- **No auth on the dashboard.** It is loopback-only by design; adding a listen address
+  beyond `127.0.0.1` would require real authentication first.
+- **History is metadata-only across restarts** — bodies are gone after a restart by design.
+- **POSIX only.** Paths (`~/.config/…`) and the shell integration assume Linux or macOS;
+  Windows would need `%APPDATA%` handling and a PowerShell profile block.
