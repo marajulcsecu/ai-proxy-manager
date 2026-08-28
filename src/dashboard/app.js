@@ -9,6 +9,7 @@ const POLL_INTERVAL_MS = 2000;
 
 // ===== STATE =====
 let lastLogCount = 0;
+let providersCache = []; // Store provider data so onclick handlers can reference it
 
 // ===== INITIALIZATION =====
 document.addEventListener('DOMContentLoaded', () => {
@@ -68,37 +69,53 @@ async function fetchProviders() {
   const data = await apiFetch('/api/providers');
   if (!data || !data.providers) return;
 
+  // Cache provider data so edit/delete handlers can look up by name
+  providersCache = data.providers;
+
   const grid = document.getElementById('provider-grid');
   grid.innerHTML = data.providers.map(p => {
     const models = p.models || [];
-    const hasMultipleModels = models.length > 1;
 
     // Build model display: dropdown if multiple models, plain text otherwise
     let modelDisplay;
     if (models.length > 0) {
       modelDisplay = `
         <div class="model-selector">
-          <select class="model-dropdown" onchange="switchModel('${escapeAttr(p.name)}', this.value)" ${!hasMultipleModels ? '' : ''}>
-            ${models.map(m => `<option value="${escapeAttr(m)}" ${m === p.defaultModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+          <select class="model-dropdown" onchange="switchModel('${esc(p.name)}', this.value)">
+            ${models.map(m => `<option value="${esc(m)}" ${m === p.defaultModel ? 'selected' : ''}>${esc(m)}</option>`).join('')}
           </select>
-          ${p.defaultModel ? `<span class="model-active-indicator">●</span>` : ''}
+          ${p.defaultModel ? '<span class="model-active-indicator">●</span>' : ''}
         </div>`;
     } else if (p.defaultModel) {
-      modelDisplay = `<span>${escapeHtml(p.defaultModel)}</span>`;
+      modelDisplay = `<span>${esc(p.defaultModel)}</span>`;
     } else {
-      modelDisplay = `<em style="color:var(--text-muted)">pass-through</em>`;
+      modelDisplay = '<em style="color:var(--text-muted)">pass-through</em>';
+    }
+
+    // Build model tags with delete buttons
+    let modelTags = '';
+    if (models.length > 0) {
+      modelTags = `
+        <div class="card-model-tags">
+          ${models.map(m => `
+            <span class="card-model-tag ${m === p.defaultModel ? 'card-model-tag-active' : ''}">
+              ${esc(m)}
+              <button class="card-model-tag-remove" onclick="removeModelFromProvider('${esc(p.name)}', '${esc(m)}')" title="Remove model">&times;</button>
+            </span>
+          `).join('')}
+        </div>`;
     }
 
     return `
       <div class="provider-card ${p.isActive ? 'active' : ''}">
         <div class="provider-card-header">
-          <span class="provider-name">${escapeHtml(p.name)}</span>
+          <span class="provider-name">${esc(p.name)}</span>
           ${p.isActive ? '<span class="badge badge-active">● ACTIVE</span>' : ''}
         </div>
         <div class="provider-details">
           <div class="provider-detail">
             <span>URL</span>
-            <span>${escapeHtml(p.url)}</span>
+            <span>${esc(p.url)}</span>
           </div>
           <div class="provider-detail provider-detail-model">
             <span>Model</span>
@@ -108,16 +125,13 @@ async function fetchProviders() {
             <span>API Key</span>
             <span class="${p.hasKey ? 'key-set' : 'key-missing'}">${p.hasKey ? '✅ Set' : '❌ Missing'}</span>
           </div>
-          <div class="provider-detail">
-            <span>Models</span>
-            <span class="meta-text">${models.length} saved</span>
-          </div>
         </div>
+        ${modelTags}
         <div class="provider-actions">
-          ${!p.isActive ? `<button class="btn btn-sm btn-success" onclick="activateProvider('${escapeAttr(p.name)}')">⚡ Use This</button>` : ''}
-          <button class="btn btn-sm" onclick="editProvider('${escapeAttr(p.name)}', '${escapeAttr(p.url)}', '${escapeAttr(p.defaultModel)}', ${JSON.stringify(models).replace(/'/g, "\\'")})">✏️ Edit</button>
-          <button class="btn btn-sm" onclick="openAddModelModal('${escapeAttr(p.name)}')">+ Model</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteProvider('${escapeAttr(p.name)}')">🗑️</button>
+          ${!p.isActive ? `<button class="btn btn-sm btn-success" onclick="activateProvider('${esc(p.name)}')">⚡ Use This</button>` : ''}
+          <button class="btn btn-sm" onclick="editProviderByName('${esc(p.name)}')">✏️ Edit</button>
+          <button class="btn btn-sm" onclick="openAddModelModal('${esc(p.name)}')">+ Model</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteProvider('${esc(p.name)}')">🗑️</button>
         </div>
       </div>
     `;
@@ -154,6 +168,21 @@ async function switchModel(providerName, model) {
     fetchProviders();
   } else {
     showToast(data?.error || 'Failed to switch model', true);
+  }
+}
+
+// ===== MODEL DELETION FROM CARD =====
+async function removeModelFromProvider(providerName, model) {
+  if (!confirm(`Remove model "${model}" from ${providerName}?`)) return;
+  const data = await apiFetch(`/api/providers/${providerName}/models/remove`, {
+    method: 'POST',
+    body: JSON.stringify({ model })
+  });
+  if (data && data.ok) {
+    showToast(`Removed ${model}`);
+    fetchProviders();
+  } else {
+    showToast(data?.error || 'Failed to remove model', true);
   }
 }
 
@@ -207,26 +236,35 @@ function openModal(editing = null) {
   }
 }
 
-function editProvider(name, url, model, models) {
+// FIX: Look up provider data from cache instead of passing via inline onclick attributes
+function editProviderByName(name) {
+  const p = providersCache.find(x => x.name === name);
+  if (!p) { showToast('Provider not found', true); return; }
+
   openModal(name);
-  document.getElementById('form-name').value = name;
+  document.getElementById('form-name').value = p.name;
   document.getElementById('form-name').disabled = true;
-  document.getElementById('form-url').value = url;
+  document.getElementById('form-url').value = p.url;
   document.getElementById('form-key').value = '';
   document.getElementById('form-key').placeholder = '(unchanged — leave empty to keep current key)';
-  document.getElementById('form-model').value = model;
+  document.getElementById('form-model').value = p.defaultModel || '';
 
   // Render model tags
+  const models = p.models || [];
   const container = document.getElementById('model-tags-container');
-  container.dataset.models = JSON.stringify(models || []);
-  renderModelTags(container, models || []);
+  container.dataset.models = JSON.stringify(models);
+  renderModelTags(container, models);
 }
 
 function renderModelTags(container, models) {
+  if (models.length === 0) {
+    container.innerHTML = '<span class="meta-text" style="font-size:0.8rem;">No models saved</span>';
+    return;
+  }
   container.innerHTML = models.map(m => `
     <span class="model-tag">
-      ${escapeHtml(m)}
-      <button type="button" class="model-tag-remove" onclick="removeModelTag(this, '${escapeAttr(m)}')">&times;</button>
+      ${esc(m)}
+      <button type="button" class="model-tag-remove" onclick="removeModelTag(this, '${esc(m)}')">&times;</button>
     </span>
   `).join('');
 }
@@ -328,7 +366,7 @@ async function fetchLogs() {
         <td>${time}</td>
         <td>${log.method}</td>
         <td>${log.provider ? log.provider.toUpperCase() : '—'}</td>
-        <td>${escapeHtml(modelInfo)}</td>
+        <td>${esc(modelInfo)}</td>
         <td class="${statusClass}">${statusText}</td>
       </tr>
     `;
@@ -359,13 +397,9 @@ function showToast(message, isError = false) {
 }
 
 // ===== UTILS =====
-function escapeHtml(text) {
+/** HTML-escape for rendering inside tags */
+function esc(text) {
   if (!text) return '';
   const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
   return text.replace(/[&<>"']/g, m => map[m]);
-}
-
-function escapeAttr(text) {
-  if (!text) return '';
-  return text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
