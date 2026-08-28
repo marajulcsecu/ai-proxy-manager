@@ -131,3 +131,79 @@ export function setActive(name) {
   saveConfig(config);
   Logger.success(`Active provider switched to '${name}'`);
 }
+
+/**
+ * Adds a model to a provider's available models list.
+ * @param {string} name - Name of the provider
+ * @param {string} model - The model name to add
+ */
+export function addModel(name, model) {
+  if (!name || !model) {
+    Logger.error('Usage: ai-proxy add-model <provider-name> <model-name>');
+    process.exit(1);
+  }
+
+  const config = loadConfig();
+
+  if (!config.providers[name]) {
+    Logger.error(`Provider '${name}' not found.`);
+    process.exit(1);
+  }
+
+  // Initialize models array if missing
+  if (!config.providers[name].models) {
+    config.providers[name].models = [];
+  }
+
+  if (config.providers[name].models.includes(model)) {
+    Logger.warn(`Model '${model}' already exists for provider '${name}'.`);
+    return;
+  }
+
+  config.providers[name].models.push(model);
+
+  // If no default model is set, make this the default
+  if (!config.providers[name].defaultModel) {
+    config.providers[name].defaultModel = model;
+  }
+
+  saveConfig(config);
+  Logger.success(`Model '${model}' added to '${name}' (${config.providers[name].models.length} total)`);
+}
+
+/**
+ * Removes a model from a provider's available models list.
+ * @param {string} name - Name of the provider
+ * @param {string} model - The model name to remove
+ */
+export function removeModel(name, model) {
+  if (!name || !model) {
+    Logger.error('Usage: ai-proxy remove-model <provider-name> <model-name>');
+    process.exit(1);
+  }
+
+  const config = loadConfig();
+
+  if (!config.providers[name]) {
+    Logger.error(`Provider '${name}' not found.`);
+    process.exit(1);
+  }
+
+  if (!config.providers[name].models || !config.providers[name].models.includes(model)) {
+    Logger.error(`Model '${model}' not found in provider '${name}'.`);
+    process.exit(1);
+  }
+
+  config.providers[name].models = config.providers[name].models.filter(m => m !== model);
+
+  // If we removed the active model, switch to first available
+  if (config.providers[name].defaultModel === model) {
+    config.providers[name].defaultModel = config.providers[name].models[0] || '';
+    if (config.providers[name].defaultModel) {
+      Logger.info(`Default model switched to '${config.providers[name].defaultModel}'`);
+    }
+  }
+
+  saveConfig(config);
+  Logger.success(`Model '${model}' removed from '${name}'`);
+}

@@ -92,6 +92,7 @@ export async function handleApiRequest(req, res) {
       name,
       url: data.url,
       defaultModel: data.defaultModel || '',
+      models: data.models || [],
       hasKey: !!data.apiKey,
       isActive: name === config.active_provider
     }));
@@ -114,10 +115,18 @@ export async function handleApiRequest(req, res) {
       const config = loadConfig();
       const name = body.name.toLowerCase().replace(/[^a-z0-9_-]/g, '');
 
+      const defaultModel = body.defaultModel || '';
+      const models = Array.isArray(body.models) ? body.models : [];
+      // If a default model is provided, ensure it's in the models list
+      if (defaultModel && !models.includes(defaultModel)) {
+        models.unshift(defaultModel);
+      }
+
       config.providers[name] = {
         url: body.url,
         apiKey: body.apiKey || config.providers[name]?.apiKey || '',
-        defaultModel: body.defaultModel || ''
+        defaultModel,
+        models
       };
 
       // Auto-activate if first provider
@@ -152,6 +161,7 @@ export async function handleApiRequest(req, res) {
       if (body.url !== undefined) config.providers[name].url = body.url;
       if (body.apiKey !== undefined) config.providers[name].apiKey = body.apiKey;
       if (body.defaultModel !== undefined) config.providers[name].defaultModel = body.defaultModel;
+      if (body.models !== undefined) config.providers[name].models = body.models;
 
       saveConfig(config);
       sendJSON(res, 200, { ok: true, message: `Provider '${name}' updated.` });
@@ -203,6 +213,131 @@ export async function handleApiRequest(req, res) {
     config.active_provider = name;
     saveConfig(config);
     sendJSON(res, 200, { ok: true, message: `Active provider switched to '${name}'.` });
+    return true;
+  }
+
+  // ----------------------------------------------------------
+  // POST /api/providers/:name/model — Switch active model for a provider
+  // Body: { model: "model-name" }
+  // ----------------------------------------------------------
+  const modelMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/model$/);
+  if (modelMatch && method === 'POST') {
+    try {
+      const name = modelMatch[1];
+      const body = await parseBody(req);
+      const config = loadConfig();
+
+      if (!config.providers[name]) {
+        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+        return true;
+      }
+
+      if (!body.model) {
+        sendJSON(res, 400, { ok: false, error: 'Missing required field: model' });
+        return true;
+      }
+
+      // Ensure models array exists
+      if (!config.providers[name].models) {
+        config.providers[name].models = [];
+      }
+
+      // Add to models list if not already there
+      if (!config.providers[name].models.includes(body.model)) {
+        config.providers[name].models.push(body.model);
+      }
+
+      config.providers[name].defaultModel = body.model;
+      saveConfig(config);
+      sendJSON(res, 200, { ok: true, message: `Model switched to '${body.model}' for provider '${name}'.` });
+    } catch (e) {
+      sendJSON(res, 400, { ok: false, error: e.message });
+    }
+    return true;
+  }
+
+  // ----------------------------------------------------------
+  // POST /api/providers/:name/models/add — Add a model to a provider's list
+  // Body: { model: "model-name" }
+  // ----------------------------------------------------------
+  const addModelMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/models\/add$/);
+  if (addModelMatch && method === 'POST') {
+    try {
+      const name = addModelMatch[1];
+      const body = await parseBody(req);
+      const config = loadConfig();
+
+      if (!config.providers[name]) {
+        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+        return true;
+      }
+
+      if (!body.model) {
+        sendJSON(res, 400, { ok: false, error: 'Missing required field: model' });
+        return true;
+      }
+
+      if (!config.providers[name].models) {
+        config.providers[name].models = [];
+      }
+
+      if (config.providers[name].models.includes(body.model)) {
+        sendJSON(res, 409, { ok: false, error: `Model '${body.model}' already exists.` });
+        return true;
+      }
+
+      config.providers[name].models.push(body.model);
+
+      // If no default model is set, make this the default
+      if (!config.providers[name].defaultModel) {
+        config.providers[name].defaultModel = body.model;
+      }
+
+      saveConfig(config);
+      sendJSON(res, 201, { ok: true, message: `Model '${body.model}' added to '${name}'.` });
+    } catch (e) {
+      sendJSON(res, 400, { ok: false, error: e.message });
+    }
+    return true;
+  }
+
+  // ----------------------------------------------------------
+  // POST /api/providers/:name/models/remove — Remove a model from a provider's list
+  // Body: { model: "model-name" }
+  // ----------------------------------------------------------
+  const removeModelMatch = url.match(/^\/api\/providers\/([a-z0-9_-]+)\/models\/remove$/);
+  if (removeModelMatch && method === 'POST') {
+    try {
+      const name = removeModelMatch[1];
+      const body = await parseBody(req);
+      const config = loadConfig();
+
+      if (!config.providers[name]) {
+        sendJSON(res, 404, { ok: false, error: `Provider '${name}' not found.` });
+        return true;
+      }
+
+      if (!body.model) {
+        sendJSON(res, 400, { ok: false, error: 'Missing required field: model' });
+        return true;
+      }
+
+      if (!config.providers[name].models) {
+        config.providers[name].models = [];
+      }
+
+      config.providers[name].models = config.providers[name].models.filter(m => m !== body.model);
+
+      // If we removed the active model, clear or switch to first available
+      if (config.providers[name].defaultModel === body.model) {
+        config.providers[name].defaultModel = config.providers[name].models[0] || '';
+      }
+
+      saveConfig(config);
+      sendJSON(res, 200, { ok: true, message: `Model '${body.model}' removed from '${name}'.` });
+    } catch (e) {
+      sendJSON(res, 400, { ok: false, error: e.message });
+    }
     return true;
   }
 

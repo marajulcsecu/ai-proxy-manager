@@ -69,33 +69,59 @@ async function fetchProviders() {
   if (!data || !data.providers) return;
 
   const grid = document.getElementById('provider-grid');
-  grid.innerHTML = data.providers.map(p => `
-    <div class="provider-card ${p.isActive ? 'active' : ''}">
-      <div class="provider-card-header">
-        <span class="provider-name">${escapeHtml(p.name)}</span>
-        ${p.isActive ? '<span class="badge badge-active">● ACTIVE</span>' : ''}
-      </div>
-      <div class="provider-details">
-        <div class="provider-detail">
-          <span>URL</span>
-          <span>${escapeHtml(p.url)}</span>
+  grid.innerHTML = data.providers.map(p => {
+    const models = p.models || [];
+    const hasMultipleModels = models.length > 1;
+
+    // Build model display: dropdown if multiple models, plain text otherwise
+    let modelDisplay;
+    if (models.length > 0) {
+      modelDisplay = `
+        <div class="model-selector">
+          <select class="model-dropdown" onchange="switchModel('${escapeAttr(p.name)}', this.value)" ${!hasMultipleModels ? '' : ''}>
+            ${models.map(m => `<option value="${escapeAttr(m)}" ${m === p.defaultModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
+          </select>
+          ${p.defaultModel ? `<span class="model-active-indicator">●</span>` : ''}
+        </div>`;
+    } else if (p.defaultModel) {
+      modelDisplay = `<span>${escapeHtml(p.defaultModel)}</span>`;
+    } else {
+      modelDisplay = `<em style="color:var(--text-muted)">pass-through</em>`;
+    }
+
+    return `
+      <div class="provider-card ${p.isActive ? 'active' : ''}">
+        <div class="provider-card-header">
+          <span class="provider-name">${escapeHtml(p.name)}</span>
+          ${p.isActive ? '<span class="badge badge-active">● ACTIVE</span>' : ''}
         </div>
-        <div class="provider-detail">
-          <span>Model</span>
-          <span>${p.defaultModel ? escapeHtml(p.defaultModel) : '<em style="color:var(--text-muted)">pass-through</em>'}</span>
+        <div class="provider-details">
+          <div class="provider-detail">
+            <span>URL</span>
+            <span>${escapeHtml(p.url)}</span>
+          </div>
+          <div class="provider-detail provider-detail-model">
+            <span>Model</span>
+            ${modelDisplay}
+          </div>
+          <div class="provider-detail">
+            <span>API Key</span>
+            <span class="${p.hasKey ? 'key-set' : 'key-missing'}">${p.hasKey ? '✅ Set' : '❌ Missing'}</span>
+          </div>
+          <div class="provider-detail">
+            <span>Models</span>
+            <span class="meta-text">${models.length} saved</span>
+          </div>
         </div>
-        <div class="provider-detail">
-          <span>API Key</span>
-          <span class="${p.hasKey ? 'key-set' : 'key-missing'}">${p.hasKey ? '✅ Set' : '❌ Missing'}</span>
+        <div class="provider-actions">
+          ${!p.isActive ? `<button class="btn btn-sm btn-success" onclick="activateProvider('${escapeAttr(p.name)}')">⚡ Use This</button>` : ''}
+          <button class="btn btn-sm" onclick="editProvider('${escapeAttr(p.name)}', '${escapeAttr(p.url)}', '${escapeAttr(p.defaultModel)}', ${JSON.stringify(models).replace(/'/g, "\\'")})">✏️ Edit</button>
+          <button class="btn btn-sm" onclick="openAddModelModal('${escapeAttr(p.name)}')">+ Model</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteProvider('${escapeAttr(p.name)}')">🗑️</button>
         </div>
       </div>
-      <div class="provider-actions">
-        ${!p.isActive ? `<button class="btn btn-sm btn-success" onclick="activateProvider('${escapeHtml(p.name)}')">⚡ Use This</button>` : ''}
-        <button class="btn btn-sm" onclick="editProvider('${escapeHtml(p.name)}', '${escapeHtml(p.url)}', '${escapeHtml(p.defaultModel)}')">✏️ Edit</button>
-        <button class="btn btn-sm btn-danger" onclick="deleteProvider('${escapeHtml(p.name)}')">🗑️</button>
-      </div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 }
 
 async function activateProvider(name) {
@@ -117,7 +143,53 @@ async function deleteProvider(name) {
   }
 }
 
-// ===== MODAL =====
+// ===== MODEL SWITCHING =====
+async function switchModel(providerName, model) {
+  const data = await apiFetch(`/api/providers/${providerName}/model`, {
+    method: 'POST',
+    body: JSON.stringify({ model })
+  });
+  if (data && data.ok) {
+    showToast(`${providerName.toUpperCase()} → ${model}`);
+    fetchProviders();
+  } else {
+    showToast(data?.error || 'Failed to switch model', true);
+  }
+}
+
+// ===== ADD MODEL MODAL =====
+function openAddModelModal(providerName) {
+  document.getElementById('add-model-overlay').classList.add('open');
+  document.getElementById('add-model-provider').value = providerName;
+  document.getElementById('add-model-name').value = '';
+  document.getElementById('add-model-title').textContent = `Add Model to ${providerName.toUpperCase()}`;
+}
+
+function closeAddModelModal() {
+  document.getElementById('add-model-overlay').classList.remove('open');
+}
+
+async function submitAddModel(event) {
+  event.preventDefault();
+  const providerName = document.getElementById('add-model-provider').value;
+  const model = document.getElementById('add-model-name').value.trim();
+
+  if (!model) return;
+
+  const data = await apiFetch(`/api/providers/${providerName}/models/add`, {
+    method: 'POST',
+    body: JSON.stringify({ model })
+  });
+  if (data && data.ok) {
+    showToast(`Added ${model}`);
+    closeAddModelModal();
+    fetchProviders();
+  } else {
+    showToast(data?.error || 'Failed to add model', true);
+  }
+}
+
+// ===== PROVIDER MODAL =====
 function openModal(editing = null) {
   document.getElementById('modal-overlay').classList.add('open');
   document.getElementById('form-editing').value = editing || '';
@@ -130,10 +202,12 @@ function openModal(editing = null) {
     document.getElementById('form-key').value = '';
     document.getElementById('form-model').value = '';
     document.getElementById('form-name').disabled = false;
+    document.getElementById('model-tags-container').innerHTML = '';
+    document.getElementById('model-tags-container').dataset.models = '[]';
   }
 }
 
-function editProvider(name, url, model) {
+function editProvider(name, url, model, models) {
   openModal(name);
   document.getElementById('form-name').value = name;
   document.getElementById('form-name').disabled = true;
@@ -141,6 +215,28 @@ function editProvider(name, url, model) {
   document.getElementById('form-key').value = '';
   document.getElementById('form-key').placeholder = '(unchanged — leave empty to keep current key)';
   document.getElementById('form-model').value = model;
+
+  // Render model tags
+  const container = document.getElementById('model-tags-container');
+  container.dataset.models = JSON.stringify(models || []);
+  renderModelTags(container, models || []);
+}
+
+function renderModelTags(container, models) {
+  container.innerHTML = models.map(m => `
+    <span class="model-tag">
+      ${escapeHtml(m)}
+      <button type="button" class="model-tag-remove" onclick="removeModelTag(this, '${escapeAttr(m)}')">&times;</button>
+    </span>
+  `).join('');
+}
+
+function removeModelTag(btn, model) {
+  const container = document.getElementById('model-tags-container');
+  let models = JSON.parse(container.dataset.models || '[]');
+  models = models.filter(m => m !== model);
+  container.dataset.models = JSON.stringify(models);
+  renderModelTags(container, models);
 }
 
 function closeModal() {
@@ -156,10 +252,17 @@ async function submitProvider(event) {
   const url = document.getElementById('form-url').value.trim();
   const key = document.getElementById('form-key').value.trim();
   const model = document.getElementById('form-model').value.trim();
+  const container = document.getElementById('model-tags-container');
+  let models = JSON.parse(container.dataset.models || '[]');
+
+  // Ensure current default model is in the list
+  if (model && !models.includes(model)) {
+    models.unshift(model);
+  }
 
   if (editing) {
     // UPDATE existing provider
-    const body = { url, defaultModel: model };
+    const body = { url, defaultModel: model, models };
     if (key) body.apiKey = key;
     const data = await apiFetch(`/api/providers/${editing}`, {
       method: 'PUT',
@@ -174,7 +277,7 @@ async function submitProvider(event) {
     }
   } else {
     // CREATE new provider
-    const body = { name, url, defaultModel: model };
+    const body = { name, url, defaultModel: model, models };
     if (key) body.apiKey = key;
     const data = await apiFetch('/api/providers', {
       method: 'POST',
@@ -260,4 +363,9 @@ function escapeHtml(text) {
   if (!text) return '';
   const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
   return text.replace(/[&<>"']/g, m => map[m]);
+}
+
+function escapeAttr(text) {
+  if (!text) return '';
+  return text.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }

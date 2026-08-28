@@ -9,6 +9,8 @@ import {
   addProvider, 
   setKey,
   setModel,
+  addModel,
+  removeModel,
   listProviders, 
   setActive 
 } from './controllers/providerController.js';
@@ -29,14 +31,18 @@ Usage:
   ai-proxy add-provider <name> <url>            - Register a new AI provider
   ai-proxy set-key <name> <api-key>             - Set the API key for a provider
   ai-proxy set-model <name> <model-name>        - Set the default model for a provider
+  ai-proxy add-model <name> <model-name>        - Add a model to a provider's list
+  ai-proxy remove-model <name> <model-name>     - Remove a model from a provider's list
   ai-proxy use <name>                           - Set a provider as the active default
-  ai-proxy start                                - Start the Smart Proxy Server
+  ai-proxy start                                - Start the Smart Proxy Server + Dashboard
   ai-proxy sync-vscode                          - Inject your providers into VS Code GUI
   ai-proxy setup-terminal                       - Configure your ~/.bashrc for Claude Code
   
 Examples:
   ai-proxy add-provider gorouter https://gorouter.app/v1
   ai-proxy set-key gorouter sk-12345...
+  ai-proxy add-model gorouter claude-opus-5
+  ai-proxy add-model gorouter claude-sonnet-5
   ai-proxy start
   `);
 }
@@ -62,6 +68,14 @@ switch (command) {
 
   case 'set-model':
     setModel(args[1], args[2]);
+    break;
+
+  case 'add-model':
+    addModel(args[1], args[2]);
+    break;
+
+  case 'remove-model':
+    removeModel(args[1], args[2]);
     break;
 
   case 'use':

@@ -120,9 +120,35 @@ claude</pre>
           <label for="form-model">Default Model <span class="meta-text">(leave empty for pass-through)</span></label>
           <input type="text" id="form-model" placeholder="e.g. claude-opus-5-thinking">
         </div>
+        <div class="form-group">
+          <label>Saved Models</label>
+          <div class="model-tags" id="model-tags-container" data-models="[]"></div>
+          <p class="meta-text" style="margin-top:6px; font-size:0.75rem;">Models can be added/removed via the "+ Model" button on each card.</p>
+        </div>
         <div class="form-actions">
           <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
           <button type="submit" class="btn btn-primary" id="form-submit-btn">Add Provider</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===== ADD MODEL MODAL ===== -->
+  <div class="modal-overlay" id="add-model-overlay" onclick="closeAddModelModal()">
+    <div class="modal modal-sm" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3 id="add-model-title">Add Model</h3>
+        <button class="btn-close" onclick="closeAddModelModal()">&times;</button>
+      </div>
+      <form onsubmit="submitAddModel(event)">
+        <input type="hidden" id="add-model-provider" value="">
+        <div class="form-group">
+          <label for="add-model-name">Model Name</label>
+          <input type="text" id="add-model-name" placeholder="e.g. claude-sonnet-5" required>
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" onclick="closeAddModelModal()">Cancel</button>
+          <button type="submit" class="btn btn-primary">Add Model</button>
         </div>
       </form>
     </div>
