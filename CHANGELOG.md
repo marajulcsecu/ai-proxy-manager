@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Requests died after 5 seconds and were reported as a 300-second stall.** The proxy used
+  `http.globalAgent`, whose `timeout: 5000` is applied to the socket while it is still
+  connecting; `ClientRequest.setTimeout()` defers to the socket's `connect` event, so the
+  agent's 5s timer won every race a slow connect started. Six real requests were lost to
+  this, each logged as `Upstream sent nothing for 300s (stalled)` after ~5s. The proxy now
+  owns dedicated `http`/`https` agents with `timeout: 0` and manages every deadline itself:
+  a hard ceiling, an inactivity timer armed at dispatch and re-armed on each chunk, and an
+  optional first-byte deadline. A slow-but-steady stream is no longer mistaken for a stall.
+
+### Added
+
+- **`upstreamFirstByteTimeoutMs`** setting (default `0`, disabled) — give up when a provider
+  has not produced a single byte in that long. Set it just below a CDN-fronted provider's
+  edge timeout (Cloudflare's is 100–120s) to fail fast with a readable error instead of
+  waiting for an HTML error page.
+
 ## [1.1.0] — 2026-08-28
 
 A hardening release. The proxy engine, configuration layer, REST API and dashboard were

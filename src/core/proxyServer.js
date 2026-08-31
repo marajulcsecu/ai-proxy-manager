@@ -33,6 +33,25 @@ const DASHBOARD_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '.
 /** Requests larger than this are rejected rather than buffered. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
+/**
+ * Dedicated connection pools.
+ *
+ * `http.globalAgent` ships with `timeout: 5000`, which lands on the socket
+ * before `ClientRequest.setTimeout()` can replace it — and `setTimeout()` is
+ * deferred to the socket's `connect` event, so a connect slower than 5s is
+ * killed by the agent's timer, not ours. `timeout: 0` removes that hidden
+ * deadline; every timeout in `forward()` is an explicit timer we own.
+ */
+const AGENT_OPTIONS = {
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  scheduling: 'lifo',
+  maxSockets: 64,
+  timeout: 0
+};
+export const HTTP_AGENT = new http.Agent(AGENT_OPTIONS);
+export const HTTPS_AGENT = new https.Agent(AGENT_OPTIONS);
+
 /** Dashboard files reachable over HTTP, mapped from request path. */
 const STATIC_ROUTES = {
   '/': 'index.html',
@@ -231,42 +250,72 @@ function forward(clientReq, clientRes, context) {
   let settled = false;
   let upstreamStatus = null;
   let hardDeadline = null;
+  let firstByteDeadline = null;
+  let stallTimer = null;
 
   const finish = result => {
     if (settled) return;
     settled = true;
     clearTimeout(hardDeadline);
+    clearTimeout(firstByteDeadline);
+    clearTimeout(stallTimer);
     finishRequest(logId, { bytesOut, ...result });
   };
 
-  const proxyReq = transport.request({
-    hostname: target.hostname,
-    port: target.port,
-    path: target.path,
-    method: clientReq.method,
-    headers
-  });
-
-  hardDeadline = setTimeout(() => {
-    const message = `Upstream exceeded the ${Math.round(settings.upstreamTimeoutMs / 1000)}s hard timeout`;
-    Logger.error(`[${providerName}] ${message}`);
-    finish({ error: message, statusCode: 504 });
-    proxyReq.destroy();
-    sendProxyError(clientRes, 504, message, 'timeout');
-  }, settings.upstreamTimeoutMs);
-
-  // Socket-inactivity timeout: catches providers that answer 200 and then go
-  // silent mid-stream instead of hanging the client tool forever.
-  proxyReq.setTimeout(settings.upstreamStallTimeoutMs, () => {
-    const message = `Upstream sent nothing for ${Math.round(settings.upstreamStallTimeoutMs / 1000)}s (stalled)`;
+  /** Reports a timeout to the log and the client with one consistent shape. */
+  const failTimeout = message => {
     Logger.error(`[${providerName}] ${message}`);
     finish({ error: message, statusCode: upstreamStatus ?? 504 });
     proxyReq.destroy();
     sendProxyError(clientRes, 504, message, 'timeout');
+  };
+
+  const proxyReq = transport.request({    hostname: target.hostname,
+    port: target.port,
+    path: target.path,
+    method: clientReq.method,
+    headers,
+    agent: target.isTls ? HTTPS_AGENT : HTTP_AGENT
   });
+
+  hardDeadline = setTimeout(
+    () => failTimeout(`Upstream exceeded the ${Math.round(settings.upstreamTimeoutMs / 1000)}s hard timeout`),
+    settings.upstreamTimeoutMs
+  );
+
+  // Phase 1 — nothing has come back yet. Providers behind a CDN are commonly
+  // cut off by the edge at 100-120s, so failing first (and cleanly) beats
+  // waiting for a 500-byte HTML error page.
+  if (settings.upstreamFirstByteTimeoutMs > 0) {
+    firstByteDeadline = setTimeout(
+      () => failTimeout(
+        `Upstream sent no response within ${Math.round(settings.upstreamFirstByteTimeoutMs / 1000)}s`
+      ),
+      settings.upstreamFirstByteTimeoutMs
+    );
+  }
+
+  // Phase 2 — inactivity guard, armed at dispatch and re-armed on every chunk,
+  // so it covers both "never answered" and "answered then went silent".
+  // Deliberately NOT proxyReq.setTimeout(): that one is socket-scoped, and the
+  // agent's own timeout lands on the socket first (see AGENT_OPTIONS).
+  const armStallTimer = () => {
+    clearTimeout(stallTimer);
+    if (settings.upstreamStallTimeoutMs > 0) {
+      stallTimer = setTimeout(
+        () => failTimeout(
+          `Upstream sent nothing for ${Math.round(settings.upstreamStallTimeoutMs / 1000)}s (stalled)`
+        ),
+        settings.upstreamStallTimeoutMs
+      );
+    }
+  };
+  armStallTimer();
 
   proxyReq.on('response', proxyRes => {
     upstreamStatus = proxyRes.statusCode;
+    clearTimeout(firstByteDeadline);
+    armStallTimer();
     const isStream = String(proxyRes.headers['content-type'] || '').includes('text/event-stream');
     const collect = !isStream && settings.captureBodies;
     let preview = '';
@@ -274,6 +323,7 @@ function forward(clientReq, clientRes, context) {
     proxyRes.on('data', chunk => {
       if (bytesOut === 0) markFirstByte(logId);
       bytesOut += chunk.length;
+      armStallTimer();
       if (collect && preview.length < 4000) preview += chunk.toString('utf8');
     });
 

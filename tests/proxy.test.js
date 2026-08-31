@@ -49,6 +49,27 @@ before(async () => {
         res.writeHead(200, { 'content-type': 'application/json' });
         return;
       }
+      if (req.url.includes('/blackhole')) {
+        // Accepts the request and never sends response headers either — what a
+        // CDN-fronted provider looks like while it is still thinking.
+        return;
+      }
+      if (req.url.includes('/trickle')) {
+        // Streams slowly but steadily: the total run exceeds the stall timeout
+        // while no single gap does. Must NOT be aborted.
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        let sent = 0;
+        const tick = setInterval(() => {
+          if (++sent > 4) {
+            clearInterval(tick);
+            res.end('data: [DONE]\n\n');
+            return;
+          }
+          res.write(`data: {"chunk":${sent}}\n\n`);
+        }, 600);
+        res.on('close', () => clearInterval(tick));
+        return;
+      }
       if (req.url.includes('/half-stream')) {
         // Answers 200, emits an SSE preamble, then goes silent forever —
         // the failure mode that used to hang client tools indefinitely.
@@ -336,4 +357,95 @@ test('an empty provider set produces an actionable 503', async () => {
   const response = await callProxy('/v1/messages', { body: JSON.stringify({ model: 'm' }) });
   assert.equal(response.status, 503);
   assert.match((await response.json()).error.message, /add-provider/);
+});
+
+test('the first-byte deadline cuts a provider that never starts answering', async () => {
+  clearConfigCache();
+  saveConfig({
+    providers: {
+      slowedge: {
+        url: `http://127.0.0.1:${upstreamPort}/v1`,
+        apiKey: 'sk-test-slowedge-0123456789',
+        defaultModel: ''
+      }
+    },
+    active_provider: 'slowedge',
+    settings: { upstreamFirstByteTimeoutMs: 700, upstreamStallTimeoutMs: 5000, upstreamTimeoutMs: 20000 }
+  });
+  resetLogger();
+
+  const startedAt = Date.now();
+  const response = await callProxy('/v1/messages/blackhole', {
+    body: JSON.stringify({ model: 'm', messages: [] })
+  });
+  const elapsed = Date.now() - startedAt;
+  const payload = await response.json();
+
+  assert.equal(response.status, 504);
+  assert.equal(payload.error.type, 'timeout');
+  assert.match(payload.error.message, /no response within/i);
+  assert.ok(elapsed < 3000, `cut by the first-byte deadline, not the stall timer (${elapsed}ms)`);
+  assert.match(getLogs().at(-1).error, /no response within/i);
+});
+
+test('a silent provider is still aborted when the first-byte deadline is off', async () => {
+  clearConfigCache();
+  saveConfig({
+    providers: {
+      slowedge: {
+        url: `http://127.0.0.1:${upstreamPort}/v1`,
+        apiKey: 'sk-test-slowedge-0123456789',
+        defaultModel: ''
+      }
+    },
+    active_provider: 'slowedge',
+    settings: { upstreamFirstByteTimeoutMs: 0, upstreamStallTimeoutMs: 900, upstreamTimeoutMs: 20000 }
+  });
+  resetLogger();
+
+  const startedAt = Date.now();
+  const response = await callProxy('/v1/messages/blackhole', {
+    body: JSON.stringify({ model: 'm', messages: [] })
+  });
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(response.status, 504);
+  assert.match((await response.json()).error.message, /stalled/i);
+  assert.ok(elapsed < 5000, `the stall timer covers pre-header silence too (${elapsed}ms)`);
+});
+
+test('a slow but steady stream outlives the stall timeout', async () => {
+  clearConfigCache();
+  saveConfig({
+    providers: {
+      trickler: {
+        url: `http://127.0.0.1:${upstreamPort}/v1`,
+        apiKey: 'sk-test-trickler-0123456789',
+        defaultModel: ''
+      }
+    },
+    active_provider: 'trickler',
+    settings: { upstreamFirstByteTimeoutMs: 0, upstreamStallTimeoutMs: 1200, upstreamTimeoutMs: 20000 }
+  });
+  resetLogger();
+
+  const startedAt = Date.now();
+  const response = await callProxy('/v1/messages/trickle', {
+    body: JSON.stringify({ model: 'm', stream: true, messages: [] })
+  });
+  const text = await response.text();
+  const elapsed = Date.now() - startedAt;
+
+  assert.equal(response.status, 200);
+  assert.ok(elapsed > 1200, `the stream ran longer than one stall window (${elapsed}ms)`);
+  assert.match(text, /\[DONE\]/, 'the stream completed instead of being aborted mid-flight');
+  assert.equal(getLogs().at(-1).error, null, 'a steady stream is not recorded as a stall');
+});
+
+test('the upstream agents carry no hidden socket timeout', async () => {
+  const { HTTP_AGENT, HTTPS_AGENT } = await import('../src/core/proxyServer.js');
+  for (const agent of [HTTP_AGENT, HTTPS_AGENT]) {
+    assert.equal(agent.options.timeout, 0, 'node globalAgent defaults to 5000ms and would fire first');
+    assert.equal(agent.keepAlive, true);
+  }
 });

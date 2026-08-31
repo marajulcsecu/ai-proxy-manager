@@ -29,6 +29,13 @@ export class ConfigError extends Error {
 export const DEFAULT_SETTINGS = {
   /** Hard ceiling for a single upstream request (streaming replies are long). */
   upstreamTimeoutMs: 900000,
+  /**
+   * Give up if the upstream has not produced a single byte in this long.
+   * 0 disables it. Useful against CDN-fronted providers that cut the
+   * connection at 100-120s (Cloudflare error 524) — set it just below their
+   * edge timeout to fail fast with a clear message instead of an HTML page.
+   */
+  upstreamFirstByteTimeoutMs: 0,
   /** Abort if the upstream sends no bytes for this long after responding. */
   upstreamStallTimeoutMs: 300000,
   /** Send browser/SDK-lookalike headers upstream (bypasses some WAFs). */

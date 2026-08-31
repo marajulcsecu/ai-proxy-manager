@@ -289,6 +289,7 @@ Clears the in-memory history and truncates `requests.jsonl`. Traffic counters ke
   "proxyPort": 8319,
   "settings": {
     "upstreamTimeoutMs": 900000,
+    "upstreamFirstByteTimeoutMs": 0,
     "upstreamStallTimeoutMs": 300000,
     "spoofHeaders": true,
     "persistLogs": true,
