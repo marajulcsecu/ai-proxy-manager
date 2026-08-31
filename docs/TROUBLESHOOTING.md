@@ -111,6 +111,30 @@ happens on every request to one provider, the provider is broken — switch with
 
 `upstreamTimeoutMs` (default 15 minutes) is the separate hard ceiling for one request.
 
+## `API Error: 524` on long conversations, but not short ones
+
+Cloudflare returns **524** when the origin behind it produces nothing for 120 seconds. It is a
+*silence* timer, so what matters is not how long the whole answer takes but how long the
+provider waits before its first byte — and that grows with the size of the prompt, because the
+whole conversation is re-sent on every turn. A short chat starts replying in seconds; a very
+long one can take over two minutes just to begin, and dies at the edge.
+
+The wall belongs to the provider, not to this proxy. Only they can raise the Proxy Read Timeout
+or make their gateway emit a keep-alive while it works. What you can do:
+
+1. **Keep the prompt small.** In Claude Code, `claude --autocompact 200k` compacts against a
+   200k window instead of the full context, so requests never grow into the danger zone.
+   Pasted images are the other culprit: cheap in tokens, huge in bytes, and re-sent every turn.
+2. **Fail over automatically.** Turn on Settings → **Retry failed requests** and list one or
+   more **Failover providers**. A 524 delivers only a small error page and never reaches the
+   client, so re-sending to a different provider is safe — nothing is duplicated. Pick a target
+   that is *not* behind the same CDN, or it will hit the same wall.
+3. **Fail fast instead of waiting.** Set **First-byte timeout** just below the provider's edge
+   timeout (say `115000`) so you get a readable error, and a retry, ten seconds earlier.
+
+Check which providers share the problem with `curl -sI https://<provider-host>/ | grep -i
+'^server:'` — anything answering `cloudflare` has the same 100–120s ceiling.
+
 ## A local provider (Ollama, LM Studio, LiteLLM) will not work
 
 Use the full URL including the scheme and port — the proxy honours all of it:

@@ -168,8 +168,10 @@ AI_PROXY_HOME=/tmp/scratch ai-proxy start --daemon --port 8321
 Notable settings (dashboard → Settings, or edit `config.json`): `upstreamTimeoutMs`,
 `upstreamStallTimeoutMs` (aborts providers that answer `200` then go silent),
 `upstreamFirstByteTimeoutMs` (`0` = off; set it just below a CDN-fronted provider's edge
-timeout to fail fast instead of collecting a Cloudflare 524 page), `spoofHeaders`,
-`persistLogs`, `captureBodies`, `logBufferSize`, `theme`.
+timeout to fail fast instead of collecting a Cloudflare 524 page), `retryEnabled` +
+`retryMaxAttempts` + `failoverProviders` (re-send to the next provider when an attempt fails
+before any byte reached the client), `spoofHeaders`, `persistLogs`, `captureBodies`,
+`logBufferSize`, `theme`.
 
 ## Security
 

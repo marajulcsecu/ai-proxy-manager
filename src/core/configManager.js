@@ -38,6 +38,19 @@ export const DEFAULT_SETTINGS = {
   upstreamFirstByteTimeoutMs: 0,
   /** Abort if the upstream sends no bytes for this long after responding. */
   upstreamStallTimeoutMs: 300000,
+  /**
+   * Re-send a request that failed before a single byte reached the client.
+   * Off by default: a retry costs a second call, and the upstream has usually
+   * already billed the first one.
+   */
+  retryEnabled: false,
+  /** Total tries per request, the first one included. 1 disables retrying. */
+  retryMaxAttempts: 2,
+  /**
+   * Providers to try, in order, once the resolved one has failed. Names not in
+   * `providers` are ignored. Empty means "retry the same provider".
+   */
+  failoverProviders: [],
   /** Send browser/SDK-lookalike headers upstream (bypasses some WAFs). */
   spoofHeaders: true,
   /** Mirror the request history to ~/.config/ai-proxy-manager/requests.jsonl. */
@@ -50,11 +63,24 @@ export const DEFAULT_SETTINGS = {
   theme: 'system'
 };
 
+/**
+ * Fresh copy of the defaults. Array-valued settings must not be shared with
+ * DEFAULT_SETTINGS, or one config could mutate the defaults for the process.
+ * @returns {Object}
+ */
+export function defaultSettings() {
+  const out = { ...DEFAULT_SETTINGS };
+  for (const [key, value] of Object.entries(out)) {
+    if (Array.isArray(value)) out[key] = [...value];
+  }
+  return out;
+}
+
 export const DEFAULT_CONFIG = {
   providers: {},
   active_provider: null,
   proxy_port: 8319,
-  settings: { ...DEFAULT_SETTINGS }
+  settings: defaultSettings()
 };
 
 /** @type {{mtimeMs:number,size:number,config:Object}|null} */
@@ -85,7 +111,7 @@ export function normalizeConfig(raw) {
     providers: {},
     active_provider: null,
     proxy_port: 8319,
-    settings: { ...DEFAULT_SETTINGS }
+    settings: defaultSettings()
   };
 
   const port = Number(src.proxy_port);
@@ -95,7 +121,15 @@ export function normalizeConfig(raw) {
     for (const [key, fallback] of Object.entries(DEFAULT_SETTINGS)) {
       const value = src.settings[key];
       if (value === undefined || value === null) continue;
-      if (typeof fallback === 'boolean') out.settings[key] = Boolean(value);
+      if (Array.isArray(fallback)) {
+        if (!Array.isArray(value)) continue;
+        const seen = new Set();
+        for (const item of value) {
+          const name = normalizeProviderName(item);
+          if (name && !seen.has(name)) seen.add(name);
+        }
+        out.settings[key] = [...seen];
+      } else if (typeof fallback === 'boolean') out.settings[key] = Boolean(value);
       else if (typeof fallback === 'number') {
         const n = Number(value);
         if (Number.isFinite(n) && n >= 0) out.settings[key] = Math.floor(n);
@@ -104,6 +138,7 @@ export function normalizeConfig(raw) {
   }
   if (!['system', 'light', 'dark'].includes(out.settings.theme)) out.settings.theme = 'system';
   out.settings.logBufferSize = Math.min(Math.max(out.settings.logBufferSize, 10), 5000);
+  out.settings.retryMaxAttempts = Math.min(Math.max(out.settings.retryMaxAttempts, 1), 5);
 
   const providers = src.providers && typeof src.providers === 'object' ? src.providers : {};
   for (const [rawName, rawData] of Object.entries(providers)) {
@@ -151,7 +186,7 @@ export function loadConfig(options = {}) {
     stat = fs.statSync(CONFIG_FILE);
   } catch {
     // First run: materialize defaults so the CLI and dashboard agree.
-    const fresh = { ...DEFAULT_CONFIG, settings: { ...DEFAULT_SETTINGS } };
+    const fresh = { ...DEFAULT_CONFIG, settings: defaultSettings() };
     try { saveConfig(fresh); } catch { /* read-only home: still usable in memory */ }
     return fresh;
   }
@@ -190,7 +225,7 @@ export function tryLoadConfig() {
   try {
     return { ok: true, config: loadConfig(), error: null };
   } catch (error) {
-    return { ok: false, config: { ...DEFAULT_CONFIG, settings: { ...DEFAULT_SETTINGS } }, error };
+    return { ok: false, config: { ...DEFAULT_CONFIG, settings: defaultSettings() }, error };
   }
 }
 

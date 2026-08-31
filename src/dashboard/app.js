@@ -868,13 +868,16 @@ claude</pre>
 const SWITCH_FIELDS = [
   ['spoofHeaders', 'Spoof SDK headers', 'Send first-party CLI headers upstream. Needed to get past some providers’ Cloudflare rules.'],
   ['persistLogs', 'Persist request history', 'Mirror request metadata to requests.jsonl so history survives a restart.'],
-  ['captureBodies', 'Capture bodies for the inspector', 'Keep a 4 KB preview of request and response bodies in memory. Never written to disk.']
+  ['captureBodies', 'Capture bodies for the inspector', 'Keep a 4 KB preview of request and response bodies in memory. Never written to disk.'],
+  ['retryEnabled', 'Retry failed requests', 'Re-send a request that failed before any byte reached the client — gateway errors (502/503/504/52x), timeouts and connection failures. Costs a second call, and the provider has usually billed the first.']
 ];
 
 const NUMBER_FIELDS = [
   ['proxy_port', 'Proxy port', 'Requires a daemon restart, and re-running the shell setup.', 1, 65535],
   ['upstreamTimeoutMs', 'Hard request timeout (ms)', 'Absolute ceiling for one upstream request.', 1000, 3600000],
   ['upstreamStallTimeoutMs', 'Stall timeout (ms)', 'Abort when the upstream sends nothing for this long — catches providers that answer 200 then go silent.', 1000, 3600000],
+  ['upstreamFirstByteTimeoutMs', 'First-byte timeout (ms)', '0 = off. Give up when the provider has not sent a single byte in this long. Set it just below a CDN-fronted provider\u2019s edge timeout (Cloudflare cuts a silent origin at 100–120s) to fail fast instead of collecting an HTML error page.', 0, 3600000],
+  ['retryMaxAttempts', 'Attempts per request', 'Total tries, the first one included. Only used when retrying is on.', 1, 5],
   ['logBufferSize', 'History size', 'How many requests to keep in memory.', 10, 5000]
 ];
 
@@ -903,7 +906,27 @@ function renderSettings() {
         <button class="btn btn-sm" data-action="save-setting" data-key="${attr(key)}">Save</button>
       </div>
       <span class="field-hint">${esc(hint)}</span>
-    </div>`).join('');
+    </div>`).join('') + renderFailoverField(settings);
+}
+
+/**
+ * Ordered list of providers to try after the active one fails. Kept as a plain
+ * comma-separated field so it stays readable with any number of providers.
+ * @param {Object} settings
+ * @returns {string}
+ */
+function renderFailoverField(settings) {
+  const value = (settings.failoverProviders || []).join(', ');
+  const known = state.providers.map(item => item.name).join(', ') || 'none yet';
+  return `
+    <div class="field">
+      <label for="set-failoverProviders">Failover providers</label>
+      <div style="display:flex; gap:8px">
+        <input type="text" id="set-failoverProviders" value="${attr(value)}" placeholder="e.g. backup, spare">
+        <button class="btn btn-sm" data-action="save-setting-list" data-key="failoverProviders">Save</button>
+      </div>
+      <span class="field-hint">Comma-separated, tried in order when a request fails before any byte reached the client. Leave empty to retry the same provider. Configured: ${esc(known)}.</span>
+    </div>`;
 }
 
 // ========================================================= provider dialog
@@ -1283,6 +1306,28 @@ async function saveNumberSetting(key) {
   toast(data.message, data.restartRequired ? 'info' : 'ok');
 }
 
+/**
+ * Saves a comma-separated settings field as an array of provider names.
+ * @param {string} key
+ */
+async function saveListSetting(key) {
+  const value = $(`#set-${key}`).value.split(',').map(item => item.trim()).filter(Boolean);
+
+  const data = await api('/api/settings', { method: 'PUT', body: { [key]: value } });
+  if (!data || !data.ok) {
+    toast(data?.error || 'Could not save that setting', 'error');
+    return;
+  }
+  // normalizeConfig keeps any name it can parse, so warn about ones that do
+  // not match a configured provider — those are silently skipped at runtime.
+  const known = new Set(state.providers.map(item => item.name));
+  const unknown = value.filter(name => !known.has(name.trim().toLowerCase()));
+  state.settings = { ...state.settings, ...data.settings };
+  state.rendered.settings = null;
+  renderSettings();
+  toast(unknown.length ? `Saved. Ignored unknown: ${unknown.join(', ')}` : data.message, unknown.length ? 'info' : 'ok');
+}
+
 // =============================================================== event wiring
 
 /** Every delegated click action, keyed by data-action. */
@@ -1309,7 +1354,8 @@ const ACTIONS = {
   'remove-shell': () => runIntegration('remove-shell'),
   'sync-vscode': () => runIntegration('sync-vscode'),
   'toggle-setting': target => toggleSetting(target.dataset.key),
-  'save-setting': target => saveNumberSetting(target.dataset.key)
+  'save-setting': target => saveNumberSetting(target.dataset.key),
+  'save-setting-list': target => saveListSetting(target.dataset.key)
 };
 
 function wireEvents() {

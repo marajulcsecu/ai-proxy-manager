@@ -19,6 +19,25 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Retry with provider failover** (`retryEnabled`, off by default; `retryMaxAttempts`,
+  `failoverProviders`). When an attempt fails *before a single byte has reached the client*,
+  the request is re-sent — to the next configured provider, or to the same one when no
+  failover target is set. Each provider's own model pin and API key are re-applied, so a
+  failover is a genuine second route rather than a replay of the first.
+
+  What counts as retryable: connection failures, the first-byte and stall timeouts, and
+  gateway statuses `502`, `503`, `504`, `520`-`527`, `529` (Cloudflare's origin-failure
+  family, `524` included). Deliberately excluded: `429`, which needs real backoff and is
+  already retried by the calling tool, and every 4xx, which would fail identically.
+
+  Three invariants keep it safe. A response that has begun streaming is never retried — once
+  `writeHead` has run, the exchange is final. A body that was streamed rather than buffered is
+  never retried either, because there is nothing left to re-send. And a retryable error page is
+  held back (up to 64 KB) rather than forwarded, so the client sees one clean answer instead of
+  an error followed by a success; anything larger is treated as a real response and passed
+  through. Every attempt is logged as its own row with `attempt` and `retryReason`, so the
+  dashboard shows the 524 and the retry that rescued it.
+
 - **`upstreamFirstByteTimeoutMs`** setting (default `0`, disabled) — give up when a provider
   has not produced a single byte in that long. Set it just below a CDN-fronted provider's
   edge timeout (Cloudflare's is 100–120s) to fail fast with a readable error instead of

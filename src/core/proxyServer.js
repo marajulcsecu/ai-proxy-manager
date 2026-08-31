@@ -238,13 +238,36 @@ function applyModelOverride(body, provider) {
 }
 
 /**
+ * Upstream statuses worth a second attempt. These are all "the gateway in
+ * front of the model failed", never "your request was wrong": 520-527 are
+ * Cloudflare's origin-failure family, 524 being the 120s read timeout.
+ * 429 is deliberately absent — rate limits need real backoff, and the calling
+ * tool already retries them.
+ */
+const RETRYABLE_STATUS = new Set([502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 527, 529]);
+
+/**
+ * How much of a retryable error response to hold back while deciding. These
+ * pages are tiny (Cloudflare's 524 is ~900 bytes); anything larger is passed
+ * through to the client instead of being retried.
+ */
+const RETRY_PEEK_BYTES = 64 * 1024;
+
+/**
  * Forwards one request upstream and streams the response back.
+ *
+ * Resolves with `{ delivered: true }` once the client has been written to —
+ * from that moment the exchange is final. Resolves with `{ delivered: false,
+ * reason, statusCode }` when the attempt failed before a single byte reached
+ * the client, which is the only situation where retrying is safe.
+ *
  * @param {import('http').IncomingMessage} clientReq
  * @param {import('http').ServerResponse} clientRes
  * @param {Object} context
+ * @returns {Promise<{delivered:boolean, reason?:string, statusCode?:number|null}>}
  */
 function forward(clientReq, clientRes, context) {
-  const { target, headers, body, logId, settings, providerName } = context;
+  const { target, headers, body, logId, settings, providerName, canRetry } = context;
   const transport = target.isTls ? https : http;
   let bytesOut = 0;
   let settled = false;
@@ -253,121 +276,175 @@ function forward(clientReq, clientRes, context) {
   let firstByteDeadline = null;
   let stallTimer = null;
 
-  const finish = result => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(hardDeadline);
-    clearTimeout(firstByteDeadline);
-    clearTimeout(stallTimer);
-    finishRequest(logId, { bytesOut, ...result });
-  };
+  return new Promise(resolve => {
+    /** Ends the attempt exactly once; `retry` decides who answers the client. */
+    const finish = (result, retry = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hardDeadline);
+      clearTimeout(firstByteDeadline);
+      clearTimeout(stallTimer);
+      finishRequest(logId, { bytesOut, ...result });
+      resolve(retry
+        ? { delivered: false, reason: retry.reason, statusCode: retry.statusCode ?? null }
+        : { delivered: true });
+    };
 
-  /** Reports a timeout to the log and the client with one consistent shape. */
-  const failTimeout = message => {
-    Logger.error(`[${providerName}] ${message}`);
-    finish({ error: message, statusCode: upstreamStatus ?? 504 });
-    proxyReq.destroy();
-    sendProxyError(clientRes, 504, message, 'timeout');
-  };
+    /**
+     * Reports a timeout. Retried when nothing has reached the client yet;
+     * otherwise the client is told, because the stream is already half-sent.
+     */
+    const failTimeout = message => {
+      Logger.error(`[${providerName}] ${message}`);
+      const retryable = canRetry && !clientRes.headersSent;
+      finish(
+        { error: message, statusCode: upstreamStatus ?? 504 },
+        retryable ? { reason: message, statusCode: upstreamStatus } : null
+      );
+      proxyReq.destroy();
+      if (!retryable) sendProxyError(clientRes, 504, message, 'timeout');
+    };
 
-  const proxyReq = transport.request({    hostname: target.hostname,
-    port: target.port,
-    path: target.path,
-    method: clientReq.method,
-    headers,
-    agent: target.isTls ? HTTPS_AGENT : HTTP_AGENT
-  });
+    const proxyReq = transport.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.path,
+      method: clientReq.method,
+      headers,
+      agent: target.isTls ? HTTPS_AGENT : HTTP_AGENT
+    });
 
-  hardDeadline = setTimeout(
-    () => failTimeout(`Upstream exceeded the ${Math.round(settings.upstreamTimeoutMs / 1000)}s hard timeout`),
-    settings.upstreamTimeoutMs
-  );
-
-  // Phase 1 — nothing has come back yet. Providers behind a CDN are commonly
-  // cut off by the edge at 100-120s, so failing first (and cleanly) beats
-  // waiting for a 500-byte HTML error page.
-  if (settings.upstreamFirstByteTimeoutMs > 0) {
-    firstByteDeadline = setTimeout(
-      () => failTimeout(
-        `Upstream sent no response within ${Math.round(settings.upstreamFirstByteTimeoutMs / 1000)}s`
-      ),
-      settings.upstreamFirstByteTimeoutMs
+    hardDeadline = setTimeout(
+      () => failTimeout(`Upstream exceeded the ${Math.round(settings.upstreamTimeoutMs / 1000)}s hard timeout`),
+      settings.upstreamTimeoutMs
     );
-  }
 
-  // Phase 2 — inactivity guard, armed at dispatch and re-armed on every chunk,
-  // so it covers both "never answered" and "answered then went silent".
-  // Deliberately NOT proxyReq.setTimeout(): that one is socket-scoped, and the
-  // agent's own timeout lands on the socket first (see AGENT_OPTIONS).
-  const armStallTimer = () => {
-    clearTimeout(stallTimer);
-    if (settings.upstreamStallTimeoutMs > 0) {
-      stallTimer = setTimeout(
+    // Phase 1 — nothing has come back yet. Providers behind a CDN are commonly
+    // cut off by the edge at 100-120s, so failing first (and cleanly) beats
+    // waiting for a 500-byte HTML error page.
+    if (settings.upstreamFirstByteTimeoutMs > 0) {
+      firstByteDeadline = setTimeout(
         () => failTimeout(
-          `Upstream sent nothing for ${Math.round(settings.upstreamStallTimeoutMs / 1000)}s (stalled)`
+          `Upstream sent no response within ${Math.round(settings.upstreamFirstByteTimeoutMs / 1000)}s`
         ),
-        settings.upstreamStallTimeoutMs
+        settings.upstreamFirstByteTimeoutMs
       );
     }
-  };
-  armStallTimer();
 
-  proxyReq.on('response', proxyRes => {
-    upstreamStatus = proxyRes.statusCode;
-    clearTimeout(firstByteDeadline);
+    // Phase 2 — inactivity guard, armed at dispatch and re-armed on every chunk,
+    // so it covers both "never answered" and "answered then went silent".
+    // Deliberately NOT proxyReq.setTimeout(): that one is socket-scoped, and the
+    // agent's own timeout lands on the socket first (see AGENT_OPTIONS).
+    const armStallTimer = () => {
+      clearTimeout(stallTimer);
+      if (settings.upstreamStallTimeoutMs > 0) {
+        stallTimer = setTimeout(
+          () => failTimeout(
+            `Upstream sent nothing for ${Math.round(settings.upstreamStallTimeoutMs / 1000)}s (stalled)`
+          ),
+          settings.upstreamStallTimeoutMs
+        );
+      }
+    };
     armStallTimer();
-    const isStream = String(proxyRes.headers['content-type'] || '').includes('text/event-stream');
-    const collect = !isStream && settings.captureBodies;
-    let preview = '';
 
-    proxyRes.on('data', chunk => {
-      if (bytesOut === 0) markFirstByte(logId);
-      bytesOut += chunk.length;
+    proxyReq.on('response', proxyRes => {
+      upstreamStatus = proxyRes.statusCode;
+      clearTimeout(firstByteDeadline);
       armStallTimer();
-      if (collect && preview.length < 4000) preview += chunk.toString('utf8');
+      const isStream = String(proxyRes.headers['content-type'] || '').includes('text/event-stream');
+      const collect = !isStream && settings.captureBodies;
+      let preview = '';
+
+      const responseHeaders = { ...proxyRes.headers };
+      delete responseHeaders.connection;
+      delete responseHeaders['transfer-encoding'];
+
+      // A retryable gateway error is held back rather than forwarded, so a
+      // second provider still gets the chance to answer. Only these are
+      // buffered — a normal reply is piped with no added latency.
+      const peeking = canRetry && RETRYABLE_STATUS.has(proxyRes.statusCode);
+      const peeked = [];
+      let peekedBytes = 0;
+
+      /** Gives up on retrying and forwards what has been held back so far. */
+      const flushAndPipe = () => {
+        clientRes.writeHead(proxyRes.statusCode, responseHeaders);
+        for (const chunk of peeked) clientRes.write(chunk);
+        peeked.length = 0;
+        proxyRes.pipe(clientRes, { end: true });
+      };
+
+      proxyRes.on('data', chunk => {
+        if (bytesOut === 0) markFirstByte(logId);
+        bytesOut += chunk.length;
+        armStallTimer();
+        if (collect && preview.length < 4000) preview += chunk.toString('utf8');
+      });
+
+      if (peeking) {
+        proxyRes.on('data', chunk => {
+          if (clientRes.headersSent) return;
+          peeked.push(chunk);
+          peekedBytes += chunk.length;
+          // Too big to be an error page: treat it as a real response.
+          if (peekedBytes > RETRY_PEEK_BYTES) flushAndPipe();
+        });
+      } else {
+        clientRes.writeHead(proxyRes.statusCode, responseHeaders);
+        proxyRes.pipe(clientRes, { end: true });
+      }
+
+      proxyRes.on('end', () => {
+        if (preview) attachBody(logId, 'response', preview);
+        const level = proxyRes.statusCode >= 400 ? 'warn' : 'info';
+        Logger[level](`[${providerName}] ${proxyRes.statusCode} ${clientReq.method} ${target.path} (${bytesOut}B)`);
+
+        if (peeking && !clientRes.headersSent) {
+          finish(
+            { statusCode: proxyRes.statusCode, streaming: isStream },
+            { reason: `upstream returned ${proxyRes.statusCode}`, statusCode: proxyRes.statusCode }
+          );
+          return;
+        }
+        finish({ statusCode: proxyRes.statusCode, streaming: isStream });
+      });
+      proxyRes.on('error', error => {
+        const retryable = canRetry && !clientRes.headersSent;
+        finish(
+          { statusCode: proxyRes.statusCode, error: error.message, streaming: isStream },
+          retryable ? { reason: error.message, statusCode: proxyRes.statusCode } : null
+        );
+        if (!retryable) clientRes.destroy();
+      });
     });
 
-    const responseHeaders = { ...proxyRes.headers };
-    delete responseHeaders.connection;
-    delete responseHeaders['transfer-encoding'];
-
-    clientRes.writeHead(proxyRes.statusCode, responseHeaders);
-    proxyRes.pipe(clientRes, { end: true });
-
-    proxyRes.on('end', () => {
-      if (preview) attachBody(logId, 'response', preview);
-      finish({ statusCode: proxyRes.statusCode, streaming: isStream });
-      const level = proxyRes.statusCode >= 400 ? 'warn' : 'info';
-      Logger[level](`[${providerName}] ${proxyRes.statusCode} ${clientReq.method} ${target.path} (${bytesOut}B)`);
+    proxyReq.on('error', error => {
+      if (settled) return;
+      const message = `${error.code ? `${error.code}: ` : ''}${error.message}`;
+      Logger.error(`[${providerName}] upstream request failed — ${message}`);
+      const retryable = canRetry && !clientRes.headersSent;
+      finish({ error: message, statusCode: 502 }, retryable ? { reason: message, statusCode: 502 } : null);
+      if (!retryable) {
+        sendProxyError(clientRes, 502, `Could not reach ${target.hostname}: ${message}`, 'upstream_unreachable');
+      }
     });
-    proxyRes.on('error', error => {
-      finish({ statusCode: proxyRes.statusCode, error: error.message, streaming: isStream });
-      clientRes.destroy();
+
+    // Client (Claude Code, VS Code, ...) gave up: stop paying for the upstream.
+    clientRes.on('close', () => {
+      if (!settled) {
+        finish({ error: 'Client disconnected before the response completed' });
+        proxyReq.destroy();
+      }
     });
-  });
 
-  proxyReq.on('error', error => {
-    if (settled) return;
-    const message = `${error.code ? `${error.code}: ` : ''}${error.message}`;
-    Logger.error(`[${providerName}] upstream request failed — ${message}`);
-    finish({ error: message, statusCode: 502 });
-    sendProxyError(clientRes, 502, `Could not reach ${target.hostname}: ${message}`, 'upstream_unreachable');
-  });
-
-  // Client (Claude Code, VS Code, ...) gave up: stop paying for the upstream.
-  clientRes.on('close', () => {
-    if (!settled) {
-      finish({ error: 'Client disconnected before the response completed' });
-      proxyReq.destroy();
+    if (body === null) {
+      clientReq.pipe(proxyReq, { end: true });
+    } else {
+      if (body.length) proxyReq.write(body);
+      proxyReq.end();
     }
   });
-
-  if (body === null) {
-    clientReq.pipe(proxyReq, { end: true });
-  } else {
-    if (body.length) proxyReq.write(body);
-    proxyReq.end();
-  }
 }
 
 /**
@@ -387,9 +464,9 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
   const settings = config.settings;
   const token = extractClientToken(clientReq.headers);
   const route = resolveRoute(config, token);
-  const provider = route.name ? config.providers[route.name] : null;
 
-  if (!provider) {
+  // Fail before reading the body when there is nowhere to send it at all.
+  if (!route.name || !config.providers[route.name]) {
     const message = Object.keys(config.providers).length
       ? `No active provider selected. Run: ai-proxy use <name>`
       : `No providers configured yet. Add one: ai-proxy add-provider <name> <url>`;
@@ -398,44 +475,159 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
     return sendProxyError(clientRes, 503, message, 'not_configured');
   }
 
-  let target;
-  try {
-    target = resolveUpstream(provider.url, pathname + search);
-  } catch (urlError) {
-    const message = `Provider '${route.name}' has an invalid URL: ${urlError.message}`;
-    Logger.error(message);
-    const logId = startRequest({ method: clientReq.method, path: pathname + search, provider: route.name });
-    finishRequest(logId, { statusCode: 500, error: message });
-    return sendProxyError(clientRes, 500, message, 'config_error');
-  }
-
-  if (!route.key) {
-    const message = `Provider '${route.name}' has no API key. Run: ai-proxy set-key ${route.name} <key>`;
-    const logId = startRequest({
-      method: clientReq.method, path: pathname + search, provider: route.name, targetHost: target.hostname
-    });
-    finishRequest(logId, { statusCode: 401, error: message });
-    return sendProxyError(clientRes, 401, message, 'authentication_error');
-  }
-
   const shouldBuffer = clientReq.method === 'POST' && isModelBearingPath(pathname);
-  let body = null;
-  let override = { originalModel: null, swappedModel: null, streaming: false };
+  let raw = null;
 
   if (shouldBuffer) {
     try {
-      const raw = await readBody(clientReq);
-      override = applyModelOverride(raw, provider);
-      body = override.body;
+      raw = await readBody(clientReq);
     } catch (bodyError) {
       return sendProxyError(clientRes, bodyError.statusCode || 400, bodyError.message, 'invalid_request_error');
     }
   }
 
+  // A body we did not buffer is streamed straight through, so it is gone once
+  // the first attempt has consumed it — such a request can never be retried.
+  const replayable = raw !== null || !hasRequestBody(clientReq);
+  const plan = replayable ? buildAttemptPlan(config, route.name) : [route.name];
+  const client = String(clientReq.headers['x-client-name'] || clientReq.headers['user-agent'] || '').slice(0, 120);
+  let retryReason = null;
+
+  for (let attempt = 1; attempt <= plan.length; attempt++) {
+    const candidate = plan[attempt - 1];
+    const isLast = attempt === plan.length;
+    const step = prepareAttempt({
+      config, candidate, clientReq, pathname, search, raw, settings,
+      // Only the first hop may fall back to the caller's own key; a failover
+      // provider must use its own, or it would authenticate as the wrong user.
+      apiKey: attempt === 1 ? route.key : (config.providers[candidate]?.apiKey || null)
+    });
+
+    if (!step.ok) {
+      // A misconfigured failover target is skipped rather than fatal.
+      if (!isLast) {
+        Logger.warn(`[${candidate}] skipped — ${step.message}`);
+        continue;
+      }
+      const logId = startRequest({
+        method: clientReq.method, path: pathname + search, provider: candidate, attempt, retryReason
+      });
+      finishRequest(logId, { statusCode: step.statusCode, error: step.message });
+      return sendProxyError(clientRes, step.statusCode, step.message, step.type);
+    }
+
+    const { target, headers, body, override } = step;
+    const logId = startRequest({
+      method: clientReq.method,
+      path: pathname + search,
+      provider: candidate,
+      targetHost: target.hostname,
+      targetUrl: target.displayUrl,
+      originalModel: override.originalModel,
+      swappedModel: override.swappedModel,
+      streaming: override.streaming,
+      client,
+      bytesIn: body ? body.length : 0,
+      attempt,
+      retryReason
+    });
+
+    if (body && settings.captureBodies) attachBody(logId, 'request', body.toString('utf8'));
+    if (override.originalModel && override.swappedModel && override.originalModel !== override.swappedModel) {
+      Logger.info(`[${candidate}] model ${override.originalModel} → ${override.swappedModel}`);
+    }
+
+    const result = await forward(clientReq, clientRes, {
+      target, headers, body, logId, settings, providerName: candidate, canRetry: !isLast
+    });
+
+    if (result.delivered) return;
+
+    // Nothing reached the client, so another provider may still answer.
+    retryReason = result.reason;
+    const next = plan[attempt];
+    Logger.warn(`[${candidate}] attempt ${attempt} failed (${result.reason}) — retrying with ${next}`);
+  }
+}
+
+/**
+ * True when the incoming request carries a payload. Used to decide whether an
+ * unbuffered body would have to be replayed on a retry (it cannot be).
+ * @param {import('http').IncomingMessage} req
+ * @returns {boolean}
+ */
+function hasRequestBody(req) {
+  if (req.headers['transfer-encoding']) return true;
+  return Number(req.headers['content-length'] || 0) > 0;
+}
+
+/**
+ * Ordered provider names to try for one request: the resolved provider first,
+ * then each configured failover target. Returns a single entry unless retrying
+ * is switched on.
+ * @param {Object} config
+ * @param {string} primary - resolved provider name
+ * @returns {string[]}
+ */
+export function buildAttemptPlan(config, primary) {
+  const { retryEnabled, retryMaxAttempts, failoverProviders } = config.settings;
+  if (!retryEnabled || retryMaxAttempts < 2) return [primary];
+
+  const plan = [primary];
+  for (const name of failoverProviders) {
+    if (plan.length >= retryMaxAttempts) break;
+    if (name !== primary && config.providers[name]) plan.push(name);
+  }
+  // No usable failover target configured: try the same provider again, which
+  // still helps against a one-off gateway hiccup.
+  while (plan.length < retryMaxAttempts && plan.length < 2) plan.push(primary);
+  return plan;
+}
+
+/**
+ * Builds everything one attempt needs. The model override and the auth header
+ * are per-provider, so this runs again for every candidate.
+ * @param {Object} args
+ * @returns {{ok:boolean, message?:string, statusCode?:number, type?:string,
+ *   target?:Object, headers?:Object, body?:Buffer|null, override?:Object}}
+ */
+function prepareAttempt({ config, candidate, clientReq, pathname, search, raw, settings, apiKey }) {
+  const provider = candidate ? config.providers[candidate] : null;
+  if (!provider) {
+    return {
+      ok: false, statusCode: 503, type: 'not_configured',
+      message: Object.keys(config.providers).length
+        ? 'No active provider selected. Run: ai-proxy use <name>'
+        : 'No providers configured yet. Add one: ai-proxy add-provider <name> <url>'
+    };
+  }
+
+  let target;
+  try {
+    target = resolveUpstream(provider.url, pathname + search);
+  } catch (urlError) {
+    return {
+      ok: false, statusCode: 500, type: 'config_error',
+      message: `Provider '${candidate}' has an invalid URL: ${urlError.message}`
+    };
+  }
+
+  if (!apiKey) {
+    return {
+      ok: false, statusCode: 401, type: 'authentication_error',
+      message: `Provider '${candidate}' has no API key. Run: ai-proxy set-key ${candidate} <key>`
+    };
+  }
+
+  const override = raw === null
+    ? { body: null, originalModel: null, swappedModel: null, streaming: false }
+    : applyModelOverride(raw, provider);
+  const body = raw === null ? null : override.body;
+
   const headers = buildUpstreamHeaders({
     incoming: clientReq.headers,
     hostHeader: target.hostHeader,
-    apiKey: route.key,
+    apiKey,
     spoof: settings.spoofHeaders !== false
   });
   if (body !== null) {
@@ -445,25 +637,7 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
     headers['content-length'] = clientReq.headers['content-length'];
   }
 
-  const logId = startRequest({
-    method: clientReq.method,
-    path: pathname + search,
-    provider: route.name,
-    targetHost: target.hostname,
-    targetUrl: target.displayUrl,
-    originalModel: override.originalModel,
-    swappedModel: override.swappedModel,
-    streaming: override.streaming,
-    client: String(clientReq.headers['x-client-name'] || clientReq.headers['user-agent'] || '').slice(0, 120),
-    bytesIn: body ? body.length : 0
-  });
-
-  if (body && settings.captureBodies) attachBody(logId, 'request', body.toString('utf8'));
-  if (override.originalModel && override.swappedModel && override.originalModel !== override.swappedModel) {
-    Logger.info(`[${route.name}] model ${override.originalModel} → ${override.swappedModel}`);
-  }
-
-  forward(clientReq, clientRes, { target, headers, body, logId, settings, providerName: route.name });
+  return { ok: true, target, headers, body, override };
 }
 
 /**

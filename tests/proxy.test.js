@@ -26,6 +26,9 @@ let proxyUrl;
 /** Records what the upstream actually received. */
 const received = [];
 
+/** Controls how many times the /flaky route fails before answering. */
+const flaky = { remaining: 0 };
+
 before(async () => {
   upstream = http.createServer((req, res) => {
     let body = '';
@@ -47,6 +50,24 @@ before(async () => {
       if (req.url.includes('/hang')) {
         // Accepts the request and never answers at all.
         res.writeHead(200, { 'content-type': 'application/json' });
+        return;
+      }
+      if (req.url.includes('flaky=1')) {
+        // Fails with a Cloudflare-style gateway error until the counter runs
+        // out, then answers normally. Lets a test watch a retry succeed.
+        if (flaky.remaining > 0) {
+          flaky.remaining--;
+          res.writeHead(524, { 'content-type': 'text/html' });
+          res.end('<html>Error 524: A timeout occurred</html>');
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, servedBy: req.headers['x-api-key'] }));
+        return;
+      }
+      if (req.url.includes('fail=524')) {
+        res.writeHead(524, { 'content-type': 'text/html' });
+        res.end('<html>Error 524: A timeout occurred</html>');
         return;
       }
       if (req.url.includes('/blackhole')) {
@@ -448,4 +469,156 @@ test('the upstream agents carry no hidden socket timeout', async () => {
     assert.equal(agent.options.timeout, 0, 'node globalAgent defaults to 5000ms and would fire first');
     assert.equal(agent.keepAlive, true);
   }
+});
+
+/** Config with two providers and retry switched on, for the failover tests. */
+function saveRetryConfig(overrides = {}) {
+  clearConfigCache();
+  saveConfig({
+    providers: {
+      flaky: {
+        url: `http://127.0.0.1:${upstreamPort}/v1`,
+        apiKey: 'sk-test-flaky-0123456789',
+        defaultModel: 'flaky-model',
+        models: ['flaky-model']
+      },
+      backup: {
+        url: `http://127.0.0.1:${upstreamPort}/v1`,
+        apiKey: 'sk-test-backup-0123456789',
+        defaultModel: 'backup-model',
+        models: ['backup-model']
+      }
+    },
+    active_provider: 'flaky',
+    settings: {
+      upstreamFirstByteTimeoutMs: 0,
+      upstreamStallTimeoutMs: 5000,
+      upstreamTimeoutMs: 20000,
+      retryEnabled: true,
+      retryMaxAttempts: 2,
+      failoverProviders: ['backup'],
+      ...overrides
+    }
+  });
+}
+
+test('retrying is off unless it is switched on', async () => {
+  clearConfigCache();
+  saveConfig({
+    providers: { flaky: { url: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: 'sk-test-flaky-0123456789', defaultModel: '' } },
+    active_provider: 'flaky',
+    settings: { retryEnabled: false, failoverProviders: ['backup'] }
+  });
+  resetLogger();
+  flaky.remaining = 5;
+
+  const response = await callProxy('/v1/messages?flaky=1', { body: JSON.stringify({ model: 'm', messages: [] }) });
+
+  assert.equal(response.status, 524, 'the gateway error reaches the client untouched');
+  assert.equal(getLogs().length, 1, 'exactly one attempt was made');
+});
+
+test('a retryable gateway error fails over to the next provider', async () => {
+  saveRetryConfig();
+  resetLogger();
+  received.length = 0;
+  flaky.remaining = 1; // first attempt fails, the retry succeeds
+
+  const response = await callProxy('/v1/messages?flaky=1', { body: JSON.stringify({ model: 'm', messages: [] }) });
+  const payload = await response.json();
+
+  assert.equal(response.status, 200, 'the client never sees the 524');
+  assert.equal(payload.ok, true);
+  assert.equal(payload.servedBy, 'sk-test-backup-0123456789', 'the retry used the failover provider key');
+
+  const logs = getLogs();
+  assert.equal(logs.length, 2, 'both attempts are recorded');
+  assert.deepEqual(logs.map(l => l.provider), ['flaky', 'backup']);
+  assert.deepEqual(logs.map(l => l.attempt), [1, 2]);
+  assert.equal(logs[0].statusCode, 524);
+  assert.equal(logs[1].statusCode, 200);
+  assert.match(logs[1].retryReason, /524/, 'the retry records why it happened');
+  assert.equal(logs[1].swappedModel, 'backup-model', "the failover provider's own model pin is applied");
+});
+
+test('the last attempt delivers its error instead of swallowing it', async () => {
+  saveRetryConfig();
+  resetLogger();
+  flaky.remaining = 0;
+
+  const response = await callProxy('/v1/messages?fail=524', { body: JSON.stringify({ model: 'm', messages: [] }) });
+  const text = await response.text();
+
+  assert.equal(response.status, 524, 'when every provider fails the client is told');
+  assert.match(text, /524/);
+  assert.equal(getLogs().length, 2, 'both providers were tried');
+});
+
+test('a response already being streamed is never retried', async () => {
+  saveRetryConfig({ upstreamStallTimeoutMs: 900 });
+  resetLogger();
+
+  const response = await callProxy('/v1/messages/half-stream', {
+    body: JSON.stringify({ model: 'm', stream: true, messages: [] })
+  });
+  await response.text().catch(() => '');
+
+  assert.equal(response.status, 200, 'the headers had already gone out');
+  assert.equal(getLogs().length, 1, 'a half-sent stream must not be re-sent to another provider');
+});
+
+test('an unreachable provider fails over too', async () => {
+  clearConfigCache();
+  saveConfig({
+    providers: {
+      dead: { url: 'http://127.0.0.1:1/v1', apiKey: 'sk-test-dead-0123456789', defaultModel: '' },
+      backup: { url: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: 'sk-test-backup-0123456789', defaultModel: '' }
+    },
+    active_provider: 'dead',
+    settings: { retryEnabled: true, retryMaxAttempts: 2, failoverProviders: ['backup'] }
+  });
+  resetLogger();
+
+  const response = await callProxy('/v1/messages', { body: JSON.stringify({ model: 'm', messages: [] }) });
+
+  assert.equal(response.status, 200);
+  const logs = getLogs();
+  assert.equal(logs.length, 2);
+  assert.match(logs[0].error, /ECONNREFUSED/);
+  assert.match(logs[1].retryReason, /ECONNREFUSED/);
+});
+
+test('buildAttemptPlan honours the attempt cap and skips unknown providers', async () => {
+  const { buildAttemptPlan } = await import('../src/core/proxyServer.js');
+  const config = name => ({
+    providers: { a: {}, b: {}, c: {} },
+    settings: {
+      retryEnabled: true, retryMaxAttempts: 3,
+      failoverProviders: ['b', 'nope', 'c'], ...name
+    }
+  });
+
+  assert.deepEqual(buildAttemptPlan(config(), 'a'), ['a', 'b', 'c']);
+  assert.deepEqual(buildAttemptPlan(config({ retryMaxAttempts: 2 }), 'a'), ['a', 'b']);
+  assert.deepEqual(buildAttemptPlan(config({ retryEnabled: false }), 'a'), ['a'], 'off means one attempt');
+  assert.deepEqual(
+    buildAttemptPlan(config({ failoverProviders: [] }), 'a'), ['a', 'a'],
+    'with no failover target the same provider is retried once'
+  );
+  assert.deepEqual(buildAttemptPlan(config({ failoverProviders: ['a'] }), 'a'), ['a', 'a'], 'self is not a failover');
+});
+
+test('a streamed body is never retried, because it cannot be replayed', async () => {
+  saveRetryConfig();
+  resetLogger();
+  received.length = 0;
+
+  // /v1/files is not a model-bearing path, so the proxy pipes the body straight
+  // through instead of buffering it — there is nothing left to re-send.
+  const response = await callProxy('/v1/files?fail=524', { body: JSON.stringify({ payload: 'x'.repeat(200) }) });
+
+  assert.equal(response.status, 524, 'the error is delivered rather than retried blindly');
+  assert.equal(getLogs().length, 1, 'exactly one attempt');
+  assert.equal(received.length, 1, 'the upstream was called once');
+  assert.equal(received[0].body.length, JSON.stringify({ payload: 'x'.repeat(200) }).length, 'the streamed body arrived intact');
 });

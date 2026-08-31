@@ -107,6 +107,8 @@ function appendToDisk(entry) {
  * @param {boolean} [entry.streaming]
  * @param {string} [entry.client] - user agent of the calling tool
  * @param {number} [entry.bytesIn]
+ * @param {number} [entry.attempt] - 1 for the first try, 2+ for a retry
+ * @param {string} [entry.retryReason] - why the previous attempt was retried
  * @returns {number} request id, to be passed to finishRequest()
  */
 export function startRequest(entry) {
@@ -131,6 +133,8 @@ export function startRequest(entry) {
     durationMs: null,
     ttfbMs: null,
     error: null,
+    attempt: entry.attempt || 1,
+    retryReason: entry.retryReason || null,
     _startedAt: Date.now()
   };
 
