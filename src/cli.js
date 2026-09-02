@@ -13,7 +13,9 @@ import {
 import {
   syncVsCode, applyShellSetup, removeShellSetup, getIntegrationStatus
 } from './controllers/integrationController.js';
-import { importKeys } from './controllers/keysController.js';
+import {
+  importKeys, listKeys, nextKey, useKey, retireKey, reviveKey
+} from './controllers/keysController.js';
 import { startProxyServer } from './core/proxyServer.js';
 import { loadConfig, CONFIG_FILE } from './core/configManager.js';
 import {
@@ -62,6 +64,11 @@ ${Logger.value('Providers')}
 
 ${Logger.value('Keys')}
   keys import <file…> [--dry-run]      Import accounts from .xlsx/.csv spreadsheets
+  keys list [name]                     Show each pool: status, balance, key in use
+  keys next <name>                     Switch to the next usable key
+  keys use <name> <n|id|label>         Switch to a specific key
+  keys retire <name> [n|id|label]      Mark a key spent and switch to the next
+  keys revive <name> <n|id|label>      Put a key back in the pool as untested
 
 ${Logger.value('Models')}
   set-model <name> <model|"">          Pin a model ("" restores pass-through)
@@ -198,8 +205,7 @@ async function runLogs(flags) {
 }
 
 /**
- * `keys` sub-commands. Only `import` exists so far; rotation lands with the
- * detection work, and each one is listed here so an unknown verb says what is
+ * `keys` sub-commands. Listed explicitly so an unknown verb says what is
  * actually available rather than printing the whole CLI help.
  */
 function runKeys(args, flags) {
@@ -208,10 +214,26 @@ function runKeys(args, flags) {
     case 'import':
       importKeys(rest, { dryRun: Boolean(flags['dry-run'] || flags.dry) });
       break;
+    case 'list':
+    case 'ls':
+      listKeys(rest[0]);
+      break;
+    case 'next':
+      nextKey(rest[0]);
+      break;
+    case 'use':
+      useKey(rest[0], rest[1]);
+      break;
+    case 'retire':
+      retireKey(rest[0], rest[1]);
+      break;
+    case 'revive':
+      reviveKey(rest[0], rest[1]);
+      break;
     default:
       throw new UsageError(
-        action ? `Unknown keys command: '${action}'` : 'Usage: ai-proxy keys import <file.xlsx|file.csv> [--dry-run]',
-        'Available: import'
+        action ? `Unknown keys command: '${action}'` : 'Usage: ai-proxy keys <import|list|next|use|retire|revive>',
+        'Available: import, list, next, use, retire, revive'
       );
   }
 }

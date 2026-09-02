@@ -10,6 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig } from '../core/configManager.js';
+import { selectKey, nextKeyId, applyKeyVerdict } from '../core/keyStore.js';
 import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, RE_KEY } from '../core/keyImport.js';
 import { Logger } from '../utils/logger.js';
 import { UsageError } from '../utils/errors.js';
@@ -143,4 +144,214 @@ function reportImport(summary) {
 
   Logger.dim('  Balances from a spreadsheet are only as fresh as the sheet — run a check to measure them.');
   if (summary.dryRun) Logger.info('Dry run: config.json was not touched. Re-run without --dry-run to apply.');
+}
+
+// --- the manual switch -------------------------------------------------------
+
+/** Looks a provider up, with a helpful error when it is missing. */
+function requireProvider(config, name) {
+  const provider = config.providers[String(name ?? '').trim().toLowerCase()];
+  if (!provider) {
+    const known = Object.keys(config.providers);
+    throw new UsageError(
+      `Provider '${name}' not found.`,
+      known.length ? `Known providers: ${known.join(', ')}` : 'Add one first: ai-proxy add-provider <name> <url>'
+    );
+  }
+  return { name: String(name).trim().toLowerCase(), provider };
+}
+
+/**
+ * Finds one key from a human-typed selector: its position in the pool (1-based),
+ * its id (or the start of it), or part of its label. Ambiguity is an error —
+ * picking the wrong account is worse than asking again.
+ * @returns {{entry: Object, index: number}}
+ */
+function requireKey(provider, selector) {
+  const keys = provider.keys || [];
+  const wanted = String(selector ?? '').trim();
+  if (!wanted) throw new UsageError('Which key? Give its number from `ai-proxy keys list`, its id, or its label.');
+
+  if (/^\d+$/.test(wanted)) {
+    const index = Number(wanted) - 1;
+    if (index < 0 || index >= keys.length) {
+      throw new UsageError(`This pool has ${keys.length} key(s), so ${wanted} is out of range.`);
+    }
+    return { entry: keys[index], index };
+  }
+
+  const lower = wanted.toLowerCase();
+  const matches = keys
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => entry.id.startsWith(lower) || (entry.label || '').toLowerCase().includes(lower));
+
+  if (!matches.length) throw new UsageError(`No key in this pool matches '${wanted}'.`);
+  if (matches.length > 1) {
+    throw new UsageError(
+      `'${wanted}' matches ${matches.length} keys.`,
+      matches.map(({ entry, index }) => `  ${index + 1}. ${entry.label || maskKey(entry.key)}`).join('\n')
+    );
+  }
+  return matches[0];
+}
+
+/**
+ * One row per key, safe to print or serve: the key itself is masked.
+ * @param {string} [providerName] - omit for every provider
+ * @returns {Array<Object>}
+ */
+export function listKeys(providerName) {
+  const config = loadConfig();
+  const names = providerName ? [requireProvider(config, providerName).name] : Object.keys(config.providers);
+
+  const rows = [];
+  for (const name of names) {
+    const provider = config.providers[name];
+    const inUse = selectKey(provider.keys, provider.selectedKeyId)?.id ?? null;
+    (provider.keys || []).forEach((entry, index) => {
+      rows.push({
+        provider: name,
+        position: index + 1,
+        id: entry.id,
+        masked: maskKey(entry.key),
+        label: entry.label,
+        status: entry.status,
+        remaining: entry.remaining,
+        needed: entry.needed,
+        requestsServed: entry.requestsServed,
+        lastUsedAt: entry.lastUsedAt,
+        lastError: entry.lastError,
+        inUse: entry.id === inUse
+      });
+    });
+  }
+
+  reportKeys(rows, names, config);
+  return rows;
+}
+
+/** Pins `entry` as the key to send and saves. */
+function pin(config, name, provider, entry) {
+  const next = {
+    ...config,
+    providers: { ...config.providers, [name]: { ...provider, selectedKeyId: entry?.id ?? '' } }
+  };
+  saveConfig(next);
+  return entry;
+}
+
+/**
+ * Switches to the next usable key in the pool.
+ * @returns {{provider: string, from: Object|null, to: Object}}
+ */
+export function nextKey(providerName) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const keys = provider.keys || [];
+  if (!keys.length) throw new UsageError(`${name} has no key at all.`, 'Import some: ai-proxy keys import <file.xlsx>');
+
+  const from = selectKey(keys, provider.selectedKeyId);
+  const toId = nextKeyId(keys, from?.id ?? null);
+  if (!toId) {
+    throw new UsageError(
+      `${name} has no usable key left after ${from ? (from.label || maskKey(from.key)) : 'the current one'}.`,
+      'Top an account up and revive it (ai-proxy keys revive ' + name + ' <n>), or import more keys.'
+    );
+  }
+
+  const to = keys.find(k => k.id === toId);
+  pin(config, name, provider, to);
+  Logger.success(`${name} now uses ${to.label || maskKey(to.key)} (${to.status}).`);
+  return { provider: name, from, to };
+}
+
+/** Pins a specific key, chosen by number, id or label. */
+export function useKey(providerName, selector) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const { entry } = requireKey(provider, selector);
+
+  if (entry.status === 'invalid' || entry.status === 'disabled') {
+    throw new UsageError(
+      `That key is marked ${entry.status}, so it would never be sent.`,
+      entry.status === 'invalid'
+        ? 'A revoked key cannot be revived — replace it, or `ai-proxy keys revive` if it was marked in error.'
+        : `Enable it first: ai-proxy keys revive ${name} ${selector}`
+    );
+  }
+
+  pin(config, name, provider, entry);
+  Logger.success(`${name} now uses ${entry.label || maskKey(entry.key)} (${entry.status}).`);
+  return { provider: name, to: entry };
+}
+
+/** Marks a key spent and moves on. Defaults to the key currently in use. */
+export function retireKey(providerName, selector) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const target = selector
+    ? requireKey(provider, selector).entry
+    : selectKey(provider.keys, provider.selectedKeyId);
+  if (!target) throw new UsageError(`${name} has no key to retire.`);
+
+  const marked = applyKeyVerdict(config, name, target.id, { kind: 'exhausted', tier: 'manual', status: 0, matched: 'retired by hand' });
+  const provider2 = marked.config.providers[name];
+  const toId = nextKeyId(provider2.keys, target.id);
+  const to = toId ? provider2.keys.find(k => k.id === toId) : null;
+
+  saveConfig({
+    ...marked.config,
+    providers: { ...marked.config.providers, [name]: { ...provider2, selectedKeyId: to?.id ?? target.id } }
+  });
+
+  Logger.success(`Marked ${target.label || maskKey(target.key)} exhausted (it stays in the pool).`);
+  if (to) Logger.plain(`  ${name} now uses ${to.label || maskKey(to.key)} (${to.status}).`);
+  else Logger.warn(`${name} has no usable key left — top an account up, then: ai-proxy keys revive ${name} <n>`);
+
+  return { provider: name, from: target, to };
+}
+
+/** Puts a key back in service as untested. */
+export function reviveKey(providerName, selector) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const { entry, index } = requireKey(provider, selector);
+
+  const keys = [...provider.keys];
+  // Untested, not known-good: a topped-up account has not answered yet, and the
+  // balance the proxy last measured describes a state that no longer holds.
+  keys[index] = { ...entry, status: 'unknown', lastError: null, remaining: null, needed: null };
+  saveConfig({ ...config, providers: { ...config.providers, [name]: { ...provider, keys } } });
+
+  Logger.success(`${entry.label || maskKey(entry.key)} is back in ${name}'s pool as untested.`);
+  Logger.dim(`  Send it a request to confirm: ai-proxy keys use ${name} ${index + 1} && ai-proxy test ${name}`);
+  return { provider: name, entry: keys[index] };
+}
+
+/** Prints the pools grouped by provider. */
+function reportKeys(rows, names, config) {
+  if (!rows.length) {
+    Logger.info(names.length === 1 ? `${names[0]} has no keys yet.` : 'No keys stored yet.');
+    Logger.dim('  Import them: ai-proxy keys import <file.xlsx>');
+    return;
+  }
+
+  for (const name of names) {
+    const mine = rows.filter(row => row.provider === name);
+    if (!mine.length) continue;
+    const spent = mine.filter(row => row.status === 'exhausted').length;
+    const dead = mine.filter(row => row.status === 'invalid').length;
+
+    Logger.header(`${name} — ${mine.length} key(s)`
+      + (spent ? `, ${spent} spent` : '') + (dead ? `, ${dead} revoked` : ''));
+
+    for (const row of mine) {
+      const mark = row.inUse ? '→' : ' ';
+      const balance = row.remaining === null ? '' : ` $${row.remaining}`;
+      Logger.plain(`  ${mark} ${String(row.position).padStart(3)}. ${row.masked}  ${row.status.padEnd(9)}`
+        + `${(row.label || '').padEnd(28)}${balance}`);
+    }
+    const provider = config.providers[name];
+    if (!provider.selectedKeyId) Logger.dim('    (no explicit selection — the first usable key is sent)');
+  }
 }
