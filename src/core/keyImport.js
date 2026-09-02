@@ -48,7 +48,7 @@ export const PROVIDER_ALIASES = {
 };
 
 /** A cell that is an API key. Deliberately strict: numbers must not qualify. */
-const RE_KEY = /\bsk-[A-Za-z0-9_-]{16,}\b/;
+export const RE_KEY = /\bsk-[A-Za-z0-9_-]{16,}\b/;
 const RE_EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/;
 const RE_URL = /^https?:\/\/\S+$/i;
 const RE_NUMBER = /^-?\d+(?:\.\d+)?$/;

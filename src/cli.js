@@ -13,6 +13,7 @@ import {
 import {
   syncVsCode, applyShellSetup, removeShellSetup, getIntegrationStatus
 } from './controllers/integrationController.js';
+import { importKeys } from './controllers/keysController.js';
 import { startProxyServer } from './core/proxyServer.js';
 import { loadConfig, CONFIG_FILE } from './core/configManager.js';
 import {
@@ -59,6 +60,9 @@ ${Logger.value('Providers')}
   use <name>                           Make a provider the active default
   test [name] [--model <id>]           Send one real request and report the result
 
+${Logger.value('Keys')}
+  keys import <file…> [--dry-run]      Import accounts from .xlsx/.csv spreadsheets
+
 ${Logger.value('Models')}
   set-model <name> <model|"">          Pin a model ("" restores pass-through)
   add-model <name> <model>             Add a model to the provider's list
@@ -88,6 +92,7 @@ ${Logger.value('Examples')}
   ai-proxy add-model gorouter claude-opus-5
   ai-proxy use gorouter && ai-proxy start --daemon
   ai-proxy test gorouter
+  ai-proxy keys import ~/accounts.xlsx --dry-run
 
 Config file: ${CONFIG_FILE}
 `);
@@ -192,6 +197,25 @@ async function runLogs(flags) {
   }
 }
 
+/**
+ * `keys` sub-commands. Only `import` exists so far; rotation lands with the
+ * detection work, and each one is listed here so an unknown verb says what is
+ * actually available rather than printing the whole CLI help.
+ */
+function runKeys(args, flags) {
+  const [action, ...rest] = args;
+  switch (action) {
+    case 'import':
+      importKeys(rest, { dryRun: Boolean(flags['dry-run'] || flags.dry) });
+      break;
+    default:
+      throw new UsageError(
+        action ? `Unknown keys command: '${action}'` : 'Usage: ai-proxy keys import <file.xlsx|file.csv> [--dry-run]',
+        'Available: import'
+      );
+  }
+}
+
 async function main() {
   const { positional, flags } = parseArgs(process.argv.slice(2));
   const command = positional[0];
@@ -238,6 +262,10 @@ async function main() {
 
     case 'use':
       setActive(positional[1]);
+      break;
+
+    case 'keys':
+      runKeys(positional.slice(1), flags);
       break;
 
     case 'test':

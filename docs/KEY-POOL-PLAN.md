@@ -1,6 +1,8 @@
 # Key pool + rotation — implementation plan
 
-Status: **planned, not started.** No code written yet.
+Status: **phases 0–3 done** (branch `feat/key-pool`). Pool schema, vault and backups;
+the .xlsx reader and importer; the classifier with tests. Next: phase 4, detection and
+manual rotation, which is the first phase to touch the live request path.
 
 ## Locked decisions
 
