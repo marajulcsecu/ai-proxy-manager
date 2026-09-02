@@ -22,8 +22,16 @@ Thumbs.db
 # Secrets — never commit these.
 # config.json holds provider API keys (see docs/CONTEXT.md §10).
 config.json
+config.json.bak.*
+keys.jsonl
 .env
 .env.*
 *.pem
 *.key
 ai-proxy-export*.json
+
+# Personal account / API-key inventory. Lives here for convenience,
+# must never leave the machine.
+04_Github and API Keys/
+*.xlsx
+*.csv

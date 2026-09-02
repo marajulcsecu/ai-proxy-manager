@@ -27,3 +27,9 @@ export const REQUEST_LOG = path.join(CONFIG_DIR, 'requests.jsonl');
 
 /** Rotated copy of REQUEST_LOG. */
 export const REQUEST_LOG_ROTATED = path.join(CONFIG_DIR, 'requests.1.jsonl');
+
+/**
+ * Append-only record of every key ever saved (JSONL). Grows forever by design:
+ * it is the last line of defence against losing an account's key.
+ */
+export const KEY_VAULT = path.join(CONFIG_DIR, 'keys.jsonl');

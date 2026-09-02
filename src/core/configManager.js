@@ -15,6 +15,10 @@
 
 import fs from 'fs';
 import { CONFIG_DIR, CONFIG_FILE } from './paths.js';
+import { normalizeKeyPool, selectKeyValue, syncKeyVault } from './keyStore.js';
+
+/** How many previous versions of config.json to keep beside it. */
+const CONFIG_BACKUPS = 5;
 
 /** Thrown for unreadable / unparseable configuration. */
 export class ConfigError extends Error {
@@ -158,9 +162,14 @@ export function normalizeConfig(raw) {
     // <select> (the browser silently selects the first option instead).
     if (defaultModel && !models.includes(defaultModel)) models.unshift(defaultModel);
 
+    // `keys` is the source of truth; `apiKey` is a mirror kept for the CLI,
+    // the tester, the dashboard and the <provider>:<key> inline token.
+    const keys = normalizeKeyPool(data.keys, data.apiKey);
+
     out.providers[name] = {
       url: String(data.url ?? '').trim(),
-      apiKey: String(data.apiKey ?? ''),
+      apiKey: selectKeyValue(keys),
+      keys,
       defaultModel,
       models,
       ...(data.note ? { note: String(data.note) } : {})
@@ -230,6 +239,25 @@ export function tryLoadConfig() {
 }
 
 /**
+ * Copies the current config aside as `.bak.1`, shifting older backups down and
+ * dropping the oldest. Atomic writes protect against a truncated file; this
+ * protects against valid-but-wrong content (a bad edit, a mistaken delete).
+ * Never throws — a save must not fail because a backup could not be made.
+ */
+function rotateBackups() {
+  const at = n => `${CONFIG_FILE}.bak.${n}`;
+  try {
+    if (!fs.existsSync(CONFIG_FILE)) return;
+    fs.rmSync(at(CONFIG_BACKUPS), { force: true });
+    for (let n = CONFIG_BACKUPS - 1; n >= 1; n--) {
+      if (fs.existsSync(at(n))) fs.renameSync(at(n), at(n + 1));
+    }
+    fs.copyFileSync(CONFIG_FILE, at(1));
+    fs.chmodSync(at(1), 0o600);
+  } catch { /* best effort */ }
+}
+
+/**
  * Atomically writes the configuration to disk with restrictive permissions.
  * @param {Object} config
  * @returns {Object} the normalized config that was written
@@ -237,6 +265,8 @@ export function tryLoadConfig() {
 export function saveConfig(config) {
   const normalized = normalizeConfig(config);
   const tmpFile = `${CONFIG_FILE}.${process.pid}.tmp`;
+
+  rotateBackups();
 
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
@@ -254,6 +284,10 @@ export function saveConfig(config) {
   } catch {
     cache = null;
   }
+
+  // Append-only history, so a key can be recovered even if this very save
+  // dropped it. Deliberately after the write: the config is the primary.
+  syncKeyVault(normalized);
   return normalized;
 }
 
