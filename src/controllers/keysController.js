@@ -10,16 +10,10 @@
 import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig } from '../core/configManager.js';
-import { selectKey, nextKeyId, applyKeyVerdict } from '../core/keyStore.js';
+import { selectKey, nextKeyId, applyKeyVerdict, maskKey } from '../core/keyStore.js';
 import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, RE_KEY } from '../core/keyImport.js';
 import { Logger } from '../utils/logger.js';
 import { UsageError } from '../utils/errors.js';
-
-/** Shows enough of a key to recognise it, never enough to use it. */
-function maskKey(key) {
-  if (!key) return '';
-  return key.length <= 12 ? '••••••' : `${key.slice(0, 5)}…${key.slice(-4)}`;
-}
 
 /**
  * Compares what the file contains with what the extractor made of it.

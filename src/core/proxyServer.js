@@ -23,6 +23,8 @@ import {
   configureLogger, restorePersistedLogs
 } from './requestLogger.js';
 import { resolveUpstream, isModelBearingPath } from './upstream.js';
+import { INSPECT_STATUS } from './creditSignals.js';
+import { noteUpstreamFailure, noteKeyUsed } from './keyMonitor.js';
 import { buildUpstreamHeaders, extractClientToken } from './headers.js';
 import { writePidFile, removePidFile, findPortOwner } from './daemon.js';
 import { setRuntime } from './runtime.js';
@@ -267,7 +269,7 @@ const RETRY_PEEK_BYTES = 64 * 1024;
  * @returns {Promise<{delivered:boolean, reason?:string, statusCode?:number|null}>}
  */
 function forward(clientReq, clientRes, context) {
-  const { target, headers, body, logId, settings, providerName, canRetry } = context;
+  const { target, headers, body, logId, settings, providerName, canRetry, keyId } = context;
   const transport = target.isTls ? https : http;
   let bytesOut = 0;
   let settled = false;
@@ -364,6 +366,13 @@ function forward(clientReq, clientRes, context) {
       // second provider still gets the chance to answer. Only these are
       // buffered — a normal reply is piped with no added latency.
       const peeking = canRetry && RETRYABLE_STATUS.has(proxyRes.statusCode);
+
+      // A rejection that might be about the key (401/402/403/429) is held back
+      // too — not to retry it, but because the reason is only in the body: the
+      // relays answer "out of credit" with the same 403 a WAF uses. It is
+      // classified once the body is complete and then delivered untouched.
+      const inspecting = !peeking && !isStream && INSPECT_STATUS.has(proxyRes.statusCode);
+      const holding = peeking || inspecting;
       const peeked = [];
       let peekedBytes = 0;
 
@@ -382,7 +391,19 @@ function forward(clientReq, clientRes, context) {
         if (collect && preview.length < 4000) preview += chunk.toString('utf8');
       });
 
-      if (peeking) {
+      /**
+       * Sends a response that was held back in full. Not flushAndPipe(): the
+       * upstream stream has already ended, so piping it would never emit 'end'
+       * and the client would wait for a body it already has.
+       */
+      const deliverHeld = () => {
+        clientRes.writeHead(proxyRes.statusCode, responseHeaders);
+        for (const chunk of peeked) clientRes.write(chunk);
+        peeked.length = 0;
+        clientRes.end();
+      };
+
+      if (holding) {
         proxyRes.on('data', chunk => {
           if (clientRes.headersSent) return;
           peeked.push(chunk);
@@ -407,6 +428,24 @@ function forward(clientReq, clientRes, context) {
           );
           return;
         }
+
+        if (inspecting && !clientRes.headersSent) {
+          const rejection = Buffer.concat(peeked);
+          // Answered first, so reading the body costs the client nothing but
+          // the round trip it already made.
+          deliverHeld();
+          const noted = noteUpstreamFailure({
+            provider: providerName, keyId, statusCode: proxyRes.statusCode, body: rejection
+          });
+          finish({
+            statusCode: proxyRes.statusCode,
+            streaming: isStream,
+            keyVerdict: noted.status,
+            keyRemaining: noted.status ? noted.verdict.remaining : null
+          });
+          return;
+        }
+
         finish({ statusCode: proxyRes.statusCode, streaming: isStream });
       });
       proxyRes.on('error', error => {
@@ -496,12 +535,14 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
   for (let attempt = 1; attempt <= plan.length; attempt++) {
     const candidate = plan[attempt - 1];
     const isLast = attempt === plan.length;
-    const step = prepareAttempt({
-      config, candidate, clientReq, pathname, search, raw, settings,
-      // Only the first hop may fall back to the caller's own key; a failover
-      // provider must use its own, or it would authenticate as the wrong user.
-      apiKey: attempt === 1 ? route.key : (config.providers[candidate]?.apiKey || null)
-    });
+    // Only the first hop may fall back to the caller's own key; a failover
+    // provider must use its own, or it would authenticate as the wrong user.
+    const apiKey = attempt === 1 ? route.key : (config.providers[candidate]?.apiKey || null);
+    // Which pool entry that key is, if any: a caller-supplied inline key
+    // belongs to no pool, and nothing that happens to it may be recorded
+    // against one of ours.
+    const keyEntry = (config.providers[candidate]?.keys || []).find(entry => entry.key === apiKey) || null;
+    const step = prepareAttempt({ config, candidate, clientReq, pathname, search, raw, settings, apiKey });
 
     if (!step.ok) {
       // A misconfigured failover target is skipped rather than fatal.
@@ -521,6 +562,8 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
       method: clientReq.method,
       path: pathname + search,
       provider: candidate,
+      keyId: keyEntry?.id || null,
+      keyLabel: keyEntry?.label || null,
       targetHost: target.hostname,
       targetUrl: target.displayUrl,
       originalModel: override.originalModel,
@@ -532,13 +575,15 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
       retryReason
     });
 
+    noteKeyUsed(candidate, keyEntry?.id);
     if (body && settings.captureBodies) attachBody(logId, 'request', body.toString('utf8'));
     if (override.originalModel && override.swappedModel && override.originalModel !== override.swappedModel) {
       Logger.info(`[${candidate}] model ${override.originalModel} → ${override.swappedModel}`);
     }
 
     const result = await forward(clientReq, clientRes, {
-      target, headers, body, logId, settings, providerName: candidate, canRetry: !isLast
+      target, headers, body, logId, settings, providerName: candidate,
+      canRetry: !isLast, keyId: keyEntry?.id || null
     });
 
     if (result.delivered) return;

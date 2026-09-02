@@ -15,6 +15,9 @@ import {
 } from './configManager.js';
 import { getLogs, getLogById, getStatus, clearLogs, configureLogger } from './requestLogger.js';
 import { parseProviderUrl } from './upstream.js';
+import { maskKey, selectKey } from './keyStore.js';
+import { keyAlerts, dismissKeyAlert } from './keyMonitor.js';
+import { nextKey, useKey, retireKey, reviveKey } from '../controllers/keysController.js';
 import { testProvider } from './providerTester.js';
 import { getDaemonStatus } from './daemon.js';
 import { getRuntime } from './runtime.js';
@@ -69,14 +72,6 @@ function sendJSON(res, statusCode, data) {
   res.end(payload);
 }
 
-/** Shows enough of a key to recognise it, never enough to use it. */
-function maskKey(key) {
-  if (!key) return '';
-  const text = String(key);
-  if (text.length <= 12) return '••••••';
-  return `${text.slice(0, 5)}…${text.slice(-4)}`;
-}
-
 /**
  * Public shape of a provider (no secrets).
  * @param {string} name
@@ -100,6 +95,13 @@ function providerView(name, data, config) {
     models: data.models || [],
     hasKey: Boolean(data.apiKey),
     keyPreview: maskKey(data.apiKey),
+    // Pool summary, so the provider card can show which account is being
+    // billed and how many are spent without a request of its own.
+    keyCount: (data.keys || []).length,
+    keysSpent: (data.keys || []).filter(entry => entry.status === 'exhausted').length,
+    keysUnusable: (data.keys || []).filter(entry => entry.status === 'invalid' || entry.status === 'disabled').length,
+    keyLabel: selectKey(data.keys, data.selectedKeyId)?.label || '',
+    keyRemaining: selectKey(data.keys, data.selectedKeyId)?.remaining ?? null,
     passThrough: !data.defaultModel,
     isActive: name === config.active_provider
   };
@@ -144,6 +146,7 @@ route('GET', /^\/api\/status$/, ({ res }) => {
     port: getRuntime().port ?? config.proxy_port,
     configuredPort: config.proxy_port,
     version: readPackageVersion(),
+    keyAlerts: keyAlerts(),
     ...status
   });
 });
@@ -330,6 +333,92 @@ route('DELETE', new RegExp(`^/api/providers/(${NAME})/models/(.+)$`), ctx =>
   removeModelHandler({ ...ctx, name: ctx.params[0], model: decodeURIComponent(ctx.params[1]) })
 );
 
+// ------------------------------------------------------------------- key pool
+
+/**
+ * One provider's key pool, masked and counted. Addressed by id throughout: no
+ * response from this API ever carries a key value.
+ * @param {string} name
+ * @param {Object} data - normalized provider
+ * @returns {Object}
+ */
+function keyPoolView(name, data) {
+  const inUse = selectKey(data.keys, data.selectedKeyId)?.id ?? null;
+  const keys = (data.keys || []).map((entry, index) => ({
+    position: index + 1,
+    id: entry.id,
+    masked: maskKey(entry.key),
+    label: entry.label,
+    status: entry.status,
+    remaining: entry.remaining,
+    needed: entry.needed,
+    requestsServed: entry.requestsServed,
+    lastUsedAt: entry.lastUsedAt,
+    lastError: entry.lastError,
+    dashboardUrl: entry.dashboardUrl,
+    referralUrl: entry.referralUrl,
+    inUse: entry.id === inUse
+  }));
+
+  return {
+    name,
+    total: keys.length,
+    spent: keys.filter(key => key.status === 'exhausted').length,
+    unusable: keys.filter(key => key.status === 'invalid' || key.status === 'disabled').length,
+    selectedKeyId: data.selectedKeyId || '',
+    inUse,
+    keys
+  };
+}
+
+/** The little a caller needs to name a key back to the user. */
+function keyRef(entry) {
+  if (!entry) return null;
+  return {
+    id: entry.id,
+    label: entry.label || '',
+    masked: maskKey(entry.key),
+    status: entry.status,
+    remaining: entry.remaining ?? null
+  };
+}
+
+route('GET', /^\/api\/keys$/, ({ res }) => {
+  const config = loadConfig();
+  sendJSON(res, 200, {
+    ok: true,
+    providers: Object.entries(config.providers).map(([name, data]) => keyPoolView(name, data)),
+    alerts: keyAlerts()
+  });
+});
+
+route('POST', new RegExp(`^/api/keys/(${NAME})/next$`), ({ res, params }) => {
+  const { from, to } = nextKey(params[0]);
+  sendJSON(res, 200, { ok: true, provider: params[0], from: keyRef(from), to: keyRef(to) });
+});
+
+route('POST', new RegExp(`^/api/keys/(${NAME})/use$`), async ({ req, res, params }) => {
+  const body = await parseBody(req);
+  const { to } = useKey(params[0], body.keyId ?? body.key ?? body.selector);
+  sendJSON(res, 200, { ok: true, provider: params[0], to: keyRef(to) });
+});
+
+route('POST', new RegExp(`^/api/keys/(${NAME})/retire$`), async ({ req, res, params }) => {
+  const body = await parseBody(req).catch(() => ({}));
+  const { from, to } = retireKey(params[0], body.keyId ?? body.selector ?? '');
+  sendJSON(res, 200, { ok: true, provider: params[0], from: keyRef(from), to: keyRef(to) });
+});
+
+route('POST', new RegExp(`^/api/keys/(${NAME})/revive$`), async ({ req, res, params }) => {
+  const body = await parseBody(req);
+  const { entry } = reviveKey(params[0], body.keyId ?? body.selector);
+  sendJSON(res, 200, { ok: true, provider: params[0], entry: keyRef(entry) });
+});
+
+route('DELETE', new RegExp(`^/api/keys/(${NAME})/alerts/([a-f0-9]+)$`), ({ res, params }) => {
+  sendJSON(res, 200, { ok: true, dismissed: dismissKeyAlert(params[0], params[1]) });
+});
+
 // ----------------------------------------------------------------------- logs
 
 route('GET', /^\/api\/logs$/, ({ res, query }) => {
@@ -490,7 +579,13 @@ export async function handleApiRequest(req, res, pathname) {
     try {
       await entry.handler({ req, res, params: match.slice(1), query: url.searchParams, pathname: routePath });
     } catch (error) {
-      if (!res.headersSent) sendJSON(res, 400, { ok: false, error: error.message });
+      if (!res.headersSent) {
+        sendJSON(res, 400, {
+          ok: false,
+          error: error.message,
+          ...(error.hint ? { hint: error.hint } : {})
+        });
+      }
     }
     return true;
   }

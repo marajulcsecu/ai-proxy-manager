@@ -27,6 +27,18 @@ export const KEY_STATUSES = ['active', 'exhausted', 'invalid', 'unknown', 'disab
  * @param {string} key
  * @returns {string} 12 hex characters
  */
+/**
+ * Shows enough of a key to recognise it, never enough to use it. Every surface
+ * that displays a key — CLI, REST API, dashboard — goes through this.
+ * @param {string} key
+ * @returns {string}
+ */
+export function maskKey(key) {
+  if (!key) return '';
+  const text = String(key);
+  return text.length <= 12 ? '••••••' : `${text.slice(0, 5)}…${text.slice(-4)}`;
+}
+
 export function deriveKeyId(key) {
   return crypto.createHash('sha256').update(String(key)).digest('hex').slice(0, 12);
 }

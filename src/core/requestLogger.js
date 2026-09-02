@@ -100,6 +100,8 @@ function appendToDisk(entry) {
  * @param {string} entry.method
  * @param {string} entry.path
  * @param {string} [entry.provider]
+ * @param {string|null} [entry.keyId]
+ * @param {string|null} [entry.keyLabel]
  * @param {string} [entry.targetHost]
  * @param {string} [entry.targetUrl]
  * @param {string} [entry.originalModel]
@@ -121,6 +123,12 @@ export function startRequest(entry) {
     method: entry.method || 'GET',
     path: entry.path || '/',
     provider: entry.provider || null,
+    // Which key of the pool carried this request, and what the upstream said
+    // about it. Null for a caller-supplied inline key, which is in no pool.
+    keyId: entry.keyId || null,
+    keyLabel: entry.keyLabel || null,
+    keyVerdict: null,
+    keyRemaining: null,
     targetHost: entry.targetHost || null,
     targetUrl: entry.targetUrl || null,
     originalModel: entry.originalModel || null,
@@ -183,6 +191,8 @@ export function finishRequest(id, result = {}) {
   if (result.bytesOut !== undefined) entry.bytesOut = result.bytesOut;
   if (result.error !== undefined) entry.error = result.error;
   if (result.streaming !== undefined) entry.streaming = Boolean(result.streaming);
+  if (result.keyVerdict !== undefined) entry.keyVerdict = result.keyVerdict;
+  if (result.keyRemaining !== undefined) entry.keyRemaining = result.keyRemaining;
   entry.durationMs = Date.now() - entry._startedAt;
   appendToDisk(entry);
 }

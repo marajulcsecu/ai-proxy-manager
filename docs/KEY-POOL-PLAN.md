@@ -1,8 +1,18 @@
 # Key pool + rotation — implementation plan
 
-Status: **phases 0–3 done** (branch `feat/key-pool`). Pool schema, vault and backups;
-the .xlsx reader and importer; the classifier with tests. Next: phase 4, detection and
-manual rotation, which is the first phase to touch the live request path.
+Status: **phases 0–4 done** (branch `feat/key-pool`). Pool schema, vault and backups; the
+.xlsx reader and importer; the classifier; and live detection — the proxy now reads the
+rejection body, marks the key, raises an alert and keeps serving until the user switches.
+Next: phase 5, the bulk health check that puts a balance on all 261 keys.
+
+Two items listed under phase 4 below were deliberately left for later, because both are
+automatic rotation and the locked decision is manual-by-default:
+
+- **Key-walking in `buildAttemptPlan`** (`{provider, keyId}` pairs). Trying the next key
+  inside a retry *is* rotation, so it belongs to phase 6's per-provider `auto` switch.
+- **Rewriting the 403 body** to say which key is spent. The client currently receives the
+  upstream response byte for byte, which is the safer default for SDKs that parse it; the
+  same sentence already reaches the user through the daemon log, the CLI and the banner.
 
 ## Locked decisions
 
@@ -178,6 +188,13 @@ Files: `src/core/proxyServer.js`, `src/core/requestLogger.js`, `src/dashboard/ap
 Tests: fake upstream route returning the exact Chinese 403 body → asserts the key is marked,
 the balance is parsed, the client still receives the 403 in manual mode, and a 403 *without* a
 balance phrase leaves the key untouched.
+
+**Shipped as:** `src/core/keyMonitor.js` (the only pool code on the request path), the
+`INSPECT_STATUS` hold-and-classify branch in `proxyServer.js`, `keyId`/`keyLabel`/`keyVerdict`/
+`keyRemaining` on every logged request, `/api/keys*` + `keyAlerts` on `/api/status`, and the
+dashboard banner. 201 tests green. Two properties worth keeping: nothing is written to disk
+for a WAF 403, a 429 or a repeat verdict, and no response from the API or the dashboard ever
+carries a key value.
 
 ### Phase 5 — bulk health check + balance probe
 Files: `src/core/providerTester.js`, `src/cli.js` (`keys check`)

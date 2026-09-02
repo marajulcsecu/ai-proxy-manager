@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig, normalizeProviderName } from '../core/configManager.js';
 import { parseProviderUrl } from '../core/upstream.js';
+import { maskKey } from '../core/keyStore.js';
 import { testProvider } from '../core/providerTester.js';
 import { Logger } from '../utils/logger.js';
 import { UsageError } from '../utils/errors.js';
@@ -29,12 +30,6 @@ function requireProvider(config, rawName) {
     );
   }
   return { name, provider };
-}
-
-/** Shows enough of a key to recognise it, never enough to use it. */
-function maskKey(key) {
-  if (!key) return '';
-  return key.length <= 12 ? '••••••' : `${key.slice(0, 5)}…${key.slice(-4)}`;
 }
 
 /**

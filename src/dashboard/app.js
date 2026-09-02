@@ -306,6 +306,7 @@ async function refreshStatus() {
   state.online = Boolean(data && data.ok !== false);
   if (data) state.status = data;
   renderConnection();
+  renderKeyAlerts();
   renderOverview();
 }
 
@@ -360,6 +361,7 @@ async function refreshMeta() {
 
 function renderAll() {
   renderConnection();
+  renderKeyAlerts();
   renderOverview();
   renderProviders();
   renderLogs();
@@ -381,6 +383,98 @@ function startPolling() {
     if (document.hidden) return;
     refreshIntegrations();
   }, 15000);
+}
+
+// ============================================================== key alerts
+
+/**
+ * Money, in the form the relays quote it. `$0.71` reads as a balance;
+ * `0.710336` reads as a bug.
+ * @param {number|null} value
+ * @returns {string}
+ */
+function formatCredit(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '';
+  return `$${value.toFixed(2)}`;
+}
+
+/**
+ * The banner the proxy raises when a key stops working. It sits above every
+ * view because in manual mode nothing moves until it is answered: the proxy
+ * keeps sending the spent key on purpose, so the user decides when to switch.
+ */
+function renderKeyAlerts() {
+  const host = $('#key-alerts');
+  const alerts = state.status?.keyAlerts || [];
+  if (state.rendered.keyAlerts === signature(alerts)) return;
+  state.rendered.keyAlerts = signature(alerts);
+
+  host.hidden = alerts.length === 0;
+  host.innerHTML = alerts.map(alert => {
+    const who = alert.label || alert.masked || alert.keyId.slice(0, 8);
+    const left = formatCredit(alert.remaining);
+    const need = formatCredit(alert.needed);
+    const reason = alert.status === 'invalid'
+      ? 'was rejected as invalid'
+      : `is out of credit${left ? ` (${left} left${need ? `, ${need} needed` : ''})` : ''}`;
+
+    return `
+      <div class="key-alert is-${alert.status === 'invalid' ? 'danger' : 'warn'}">
+        <span class="key-alert-icon" aria-hidden="true">${alert.status === 'invalid' ? '✖' : '▲'}</span>
+        <span class="key-alert-text">
+          <strong>${esc(alert.provider)}</strong> key <strong>${esc(who)}</strong> ${esc(reason)}.
+          <span class="muted">Requests still go to this key until you switch.</span>
+        </span>
+        <button class="btn btn-sm btn-primary" data-action="key-next"
+                data-name="${attr(alert.provider)}">Switch →</button>
+        <button class="btn btn-sm btn-icon" data-action="key-dismiss"
+                data-name="${attr(alert.provider)}" data-key-id="${attr(alert.keyId)}"
+                aria-label="Dismiss this alert" title="Dismiss">✕</button>
+      </div>`;
+  }).join('');
+}
+
+/** Switches a provider to its next usable key. */
+async function switchKey(name) {
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/next`, { method: 'POST' });
+  if (!data?.ok) {
+    // The useful case is "nothing left to switch to", where the API's hint
+    // says what to do about it.
+    toast([data?.error, data?.hint].filter(Boolean).join(' — ') || 'Could not switch key', 'error');
+    return;
+  }
+  const to = data.to?.label || data.to?.masked || 'the next key';
+  toast(`${name} is now using ${to}`, 'ok');
+  state.rendered.keyAlerts = null;
+  refreshStatus();
+  refreshProviders();
+}
+
+/** Marks the key in use as spent and moves on — for a balance the proxy has not seen fail yet. */
+async function retireKey(name) {
+  const confirmed = await confirmDialog({
+    title: `Retire the key ${name} is using?`,
+    message: 'It is marked spent and the next usable key takes over. Nothing is deleted — revive it after a top-up.',
+    confirmLabel: 'Retire and switch'
+  });
+  if (!confirmed) return;
+
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/retire`, { method: 'POST' });
+  if (!data?.ok) {
+    toast([data?.error, data?.hint].filter(Boolean).join(' — ') || 'Could not retire that key', 'error');
+    return;
+  }
+  toast(`${name}: ${data.from?.label || 'that key'} retired, now using ${data.to?.label || data.to?.masked || 'the next key'}`, 'ok');
+  state.rendered.keyAlerts = null;
+  refreshStatus();
+  refreshProviders();
+}
+
+/** Clears the banner without changing which key is in use. */
+async function dismissKeyAlert(name, keyId) {
+  await api(`/api/keys/${encodeURIComponent(name)}/alerts/${encodeURIComponent(keyId)}`, { method: 'DELETE' });
+  state.rendered.keyAlerts = null;
+  refreshStatus();
 }
 
 // ============================================================== connection
@@ -535,6 +629,26 @@ function providerCardHtml(provider) {
                  data-focus-key="key:${attr(name)}">reveal</button>`
       : `<span class="provider-value" style="color:var(--danger)">not set</span>`;
 
+  // Only worth a row once there is more than one account to choose between.
+  const poolRow = provider.keyCount > 1
+    ? `<div class="provider-row">
+         <span>Pool</span>
+         <span class="key-pool">
+           <span class="provider-value">
+             ${esc(provider.keyLabel || 'key ' + provider.keyPreview)}
+             ${typeof provider.keyRemaining === 'number' ? `<span class="muted">· ${esc(formatCredit(provider.keyRemaining))} left</span>` : ''}
+           </span>
+           <span class="key-pool-count muted">
+             ${provider.keyCount} keys${provider.keysSpent ? ` · ${provider.keysSpent} spent` : ''}${provider.keysUnusable ? ` · ${provider.keysUnusable} dead` : ''}
+           </span>
+           <button class="key-reveal" data-action="key-next" data-name="${attr(name)}"
+                   data-focus-key="key-next:${attr(name)}" title="Switch to the next usable key">next key</button>
+           <button class="key-reveal" data-action="key-retire" data-name="${attr(name)}"
+                   data-focus-key="key-retire:${attr(name)}" title="Mark this key spent and switch">retire</button>
+         </span>
+       </div>`
+    : '';
+
   return `
     <article class="provider-card ${provider.isActive ? 'is-active' : ''} ${provider.urlValid ? '' : 'is-invalid'}">
       <header class="provider-top">
@@ -556,6 +670,7 @@ function providerCardHtml(provider) {
           <span>Key</span>
           <span class="key-line">${keyDisplay}</span>
         </div>
+        ${poolRow}
       </div>
 
       ${chips}
@@ -1346,6 +1461,9 @@ const ACTIONS = {
     renderOverview();
   },
   'add-first': () => openProviderDialog(null),
+  'key-next': target => switchKey(target.dataset.name),
+  'key-retire': target => retireKey(target.dataset.name),
+  'key-dismiss': target => dismissKeyAlert(target.dataset.name, target.dataset.keyId),
   'form-remove-model': target => {
     formModels = formModels.filter(model => model !== target.dataset.model);
     renderFormModels();

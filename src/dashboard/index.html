@@ -66,6 +66,10 @@
     <!-- ============================== MAIN ============================== -->
     <main class="content" id="main">
 
+      <!-- Key-pool alerts. Shown on every view: an out-of-credit account stops
+           traffic dead, so it must not be hidden behind a tab. -->
+      <div class="key-alerts" id="key-alerts" role="status" aria-live="polite" hidden></div>
+
       <!-- ---------------------------- OVERVIEW ---------------------------- -->
       <section class="view" id="view-overview">
         <div class="view-head">
