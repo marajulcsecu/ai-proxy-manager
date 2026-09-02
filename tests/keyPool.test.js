@@ -227,3 +227,15 @@ test('appendKeyVault tolerates an unwritable directory instead of throwing', () 
   // Persisting history must never be able to break a save.
   assert.doesNotThrow(() => appendKeyVault('gorouter', [], 'noop'));
 });
+
+test('saving tightens the config directory, not just the files inside it', () => {
+  // mkdir's mode only applies when the directory is created, so a dir made
+  // under a loose umask (the real ~/.config/ai-proxy-manager is 0755) stayed
+  // group and world readable. The files are 0600, but the directory listing
+  // itself leaks which providers and how many keys exist.
+  fs.chmodSync(home, 0o755);
+  saveProvider([{ key: 'sk-dirmode-value' }]);
+
+  assert.equal(fs.statSync(home).mode & 0o777, 0o700, 'config dir must be owner-only');
+  assert.equal(fs.statSync(CONFIG_FILE).mode & 0o777, 0o600);
+});

@@ -270,6 +270,10 @@ export function saveConfig(config) {
 
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    // mkdir's mode only applies when it creates the directory, so a dir made
+    // by an older version (or under a loose umask) stays world-readable. The
+    // files are 0600, but the listing alone reveals the provider inventory.
+    try { fs.chmodSync(CONFIG_DIR, 0o700); } catch { /* not ours to chmod */ }
     fs.writeFileSync(tmpFile, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmpFile, CONFIG_FILE);
     fs.chmodSync(CONFIG_FILE, 0o600);
