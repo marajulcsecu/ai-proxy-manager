@@ -12,6 +12,7 @@ import path from 'path';
 import { loadConfig, saveConfig } from '../core/configManager.js';
 import { selectKey, nextKeyId, applyKeyVerdict, maskKey } from '../core/keyStore.js';
 import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, RE_KEY } from '../core/keyImport.js';
+import { checkKeys, DEFAULT_LOW } from '../core/keyCheck.js';
 import { Logger } from '../utils/logger.js';
 import { UsageError } from '../utils/errors.js';
 
@@ -342,10 +343,109 @@ function reportKeys(rows, names, config) {
     for (const row of mine) {
       const mark = row.inUse ? '→' : ' ';
       const balance = row.remaining === null ? '' : ` $${row.remaining}`;
-      Logger.plain(`  ${mark} ${String(row.position).padStart(3)}. ${row.masked}  ${row.status.padEnd(9)}`
+      Logger.plain(`  ${mark} ${String(row.position).padStart(3)}. ${row.masked}  ${row.status.padEnd(10)}`
         + `${(row.label || '').padEnd(28)}${balance}`);
     }
     const provider = config.providers[name];
     if (!provider.selectedKeyId) Logger.dim('    (no explicit selection — the first usable key is sent)');
   }
+}
+
+/** What each verdict means in one word, for the live line. */
+const VERDICT_TEXT = {
+  live: 'accepted',
+  funded: 'funded',
+  spent: 'out of credit',
+  invalid: 'revoked',
+  'rate-limited': 'rate-limited',
+  blocked: 'blocked',
+  inconclusive: 'no answer',
+  error: 'unreachable'
+};
+
+/**
+ * Probes every key (or one provider's) and prints the sorted result.
+ *
+ * Without `--balance` this is one `GET /v1/models` per key: it separates the
+ * accepted keys from the revoked ones and costs nothing at all. With
+ * `--balance` each key is also asked for a request it cannot possibly afford,
+ * which the relay refuses while quoting the exact figure — the only way to tell
+ * a spent key from a working one, and the reason a topped-up account comes back
+ * into service by itself.
+ *
+ * @param {string} [providerName] - omit for every provider
+ * @param {{balance?:boolean, concurrency?:number, low?:number, timeoutMs?:number}} [options]
+ * @returns {Promise<Object>} the report from checkKeys()
+ */
+export async function checkKeysCommand(providerName, options = {}) {
+  const low = typeof options.low === 'number' && Number.isFinite(options.low) ? options.low : DEFAULT_LOW;
+  const total = countKeys(providerName);
+  if (total) {
+    Logger.info(`Checking ${total} key(s)${providerName ? ` on ${providerName}` : ''}`
+      + (options.balance ? `, balance included (spent below $${low})` : ', liveness only'));
+    if (!options.balance) Logger.dim('  Add --balance to read each account\'s remaining credit.');
+  }
+
+  const report = await checkKeys({
+    provider: providerName,
+    balance: options.balance,
+    concurrency: options.concurrency,
+    low,
+    timeoutMs: options.timeoutMs,
+    onResult: row => Logger.dim(`  ${row.provider} ${row.masked} ${(row.label || '').padEnd(26)}`
+      + `${VERDICT_TEXT[row.verdict] || row.verdict}${typeof row.remaining === 'number' ? ` $${row.remaining}` : ''}`)
+  });
+
+  reportCheck(report);
+  return report;
+}
+
+/** How many keys a run will probe, so the user knows what they started. */
+function countKeys(providerName) {
+  const config = loadConfig();
+  const names = providerName ? [requireProvider(config, providerName).name] : Object.keys(config.providers);
+  return names.reduce((sum, name) => sum + (config.providers[name].keys || []).length, 0);
+}
+
+/** Prints the outcome grouped by what the user has to do about it. */
+function reportCheck(report) {
+  if (!report.results.length) {
+    Logger.info('No keys to check.');
+    Logger.dim('  Import them: ai-proxy keys import <file.xlsx>');
+    for (const note of report.notes) Logger.dim(`  ${note}`);
+    return;
+  }
+
+  // Grouped by what came back, not by the status on file: a key that was
+  // already active and answered nothing this time belongs under "No verdict",
+  // or the run would report it as checked when it was not.
+  const groups = [
+    ['Usable', ['funded', 'live']],
+    ['Out of credit', ['spent']],
+    ['Revoked', ['invalid']],
+    ['No verdict', ['rate-limited', 'blocked', 'inconclusive', 'error']]
+  ];
+
+  for (const [title, verdicts] of groups) {
+    const mine = report.results.filter(row => verdicts.includes(row.verdict));
+    if (!mine.length) continue;
+    Logger.header(`${title} — ${mine.length}`);
+    for (const row of mine.sort((a, b) => (b.remaining ?? -1) - (a.remaining ?? -1))) {
+      const balance = typeof row.remaining === 'number' ? `$${row.remaining.toFixed(2)}`.padStart(10) : ''.padStart(10);
+      Logger.plain(`  ${row.provider.padEnd(12)}${row.masked}  ${(row.label || '').padEnd(26)}${balance}`
+        + `  ${VERDICT_TEXT[row.verdict] || row.verdict}${row.changed ? ` → ${row.status}` : ''}`);
+      if (row.message && ['invalid', 'error', 'blocked', 'inconclusive'].includes(row.verdict)) {
+        Logger.dim(`                ${row.message.slice(0, 100)}`);
+      }
+    }
+  }
+
+  Logger.plain('');
+  const totals = report.counts;
+  Logger.info(`${report.results.length} checked — ${totals.live} usable, ${totals.spent} out of credit, `
+    + `${totals.revoked} revoked, ${totals.inconclusive} without a verdict.`);
+  if (report.changed) Logger.success(`${report.changed} key(s) updated${report.revived ? `, ${report.revived} put back in service` : ''}.`);
+  else Logger.dim('  Nothing changed, so nothing was written.');
+  if (!report.balance && totals.live) Logger.dim('  "Usable" here only means the key is accepted — run with --balance to see the credit.');
+  for (const note of report.notes) Logger.warn(note);
 }

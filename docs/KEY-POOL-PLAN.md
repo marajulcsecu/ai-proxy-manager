@@ -1,9 +1,10 @@
 # Key pool + rotation — implementation plan
 
-Status: **phases 0–4 done** (branch `feat/key-pool`). Pool schema, vault and backups; the
-.xlsx reader and importer; the classifier; and live detection — the proxy now reads the
-rejection body, marks the key, raises an alert and keeps serving until the user switches.
-Next: phase 5, the bulk health check that puts a balance on all 261 keys.
+Status: **phases 0–5 done** (branch `feat/key-pool`). Pool schema, vault and backups; the
+.xlsx reader and importer; the classifier; live detection — the proxy reads the rejection
+body, marks the key, raises an alert and keeps serving until the user switches — and now
+`ai-proxy keys check --balance`, which puts a verdict and a balance on every key without
+spending anything. Next: phase 6, per-provider auto rotation.
 
 Two items listed under phase 4 below were deliberately left for later, because both are
 automatic rotation and the locked decision is manual-by-default:
@@ -211,6 +212,28 @@ Two calls per key, both effectively free:
 
 Output: all 261 keys sorted into live / no-credit / revoked, with balances. This replaces
 logging into dozens of dashboards by hand.
+
+**Shipped as:** `src/core/keyCheck.js` (a new module rather than an extension of
+`providerTester.js`, which tests *a provider* — this measures *a key*) plus
+`ai-proxy keys check [name] [--balance] [--concurrency N] [--low N] [--timeout S]`.
+Four properties are worth keeping in mind:
+
+- **A refusal is a measurement, not a verdict.** The probe asks for `max_tokens: 1000000`,
+  which no balance can pre-pay, so a $200 key is refused exactly as a $0.71 key is. Only the
+  quoted number decides, against `--low` (default $1).
+- **`stream: true` is what caps the cost.** If a key *is* rich enough to be accepted, the
+  socket is destroyed on the first byte. A non-streaming request of that size would be
+  generated — and billed — in full before the first byte ever arrived.
+- **Liveness never overrules "spent".** `GET /v1/models` says the key is accepted, nothing
+  about its credit, so it can promote `unknown` → `active` but never revive an exhausted key.
+  Each provider also gets one control probe with a made-up key: a relay that answers 200 to
+  that is not checking keys, so its liveness result promotes nothing and is called out.
+- **`disabled` is a decision, not a measurement**, and a funded probe does not undo it.
+
+One config write for the whole run, and none when nothing was learned (a 429 or a WAF page
+leaves the pool byte-identical), so the five rolling backups are not churned. Vault lines are
+tagged `event: 'check'`. 221 tests green. CLI-only for now: a 261-key run takes minutes and
+wants streaming progress, which the dashboard's polling UI is not shaped for.
 
 ### Phase 6 — auto mode, per provider
 Settings: `keyRotation: 'manual' | 'auto'` per provider, default `manual`.

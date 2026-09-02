@@ -14,7 +14,7 @@ import {
   syncVsCode, applyShellSetup, removeShellSetup, getIntegrationStatus
 } from './controllers/integrationController.js';
 import {
-  importKeys, listKeys, nextKey, useKey, retireKey, reviveKey
+  importKeys, listKeys, checkKeysCommand, nextKey, useKey, retireKey, reviveKey
 } from './controllers/keysController.js';
 import { startProxyServer } from './core/proxyServer.js';
 import { loadConfig, CONFIG_FILE } from './core/configManager.js';
@@ -39,7 +39,7 @@ function parseArgs(argv) {
     }
     const name = arg.replace(/^-+/, '');
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('-') && /^(port|n|lines|model)$/.test(name)) {
+    if (next !== undefined && !next.startsWith('-') && /^(port|n|lines|model|concurrency|low|timeout)$/.test(name)) {
       flags[name] = next;
       i++;
     } else {
@@ -65,6 +65,7 @@ ${Logger.value('Providers')}
 ${Logger.value('Keys')}
   keys import <file…> [--dry-run]      Import accounts from .xlsx/.csv spreadsheets
   keys list [name]                     Show each pool: status, balance, key in use
+  keys check [name] [--balance]        Probe every key: accepted, spent or revoked
   keys next <name>                     Switch to the next usable key
   keys use <name> <n|id|label>         Switch to a specific key
   keys retire <name> [n|id|label]      Mark a key spent and switch to the next
@@ -100,6 +101,7 @@ ${Logger.value('Examples')}
   ai-proxy use gorouter && ai-proxy start --daemon
   ai-proxy test gorouter
   ai-proxy keys import ~/accounts.xlsx --dry-run
+  ai-proxy keys check --balance --concurrency 4
 
 Config file: ${CONFIG_FILE}
 `);
@@ -208,7 +210,7 @@ async function runLogs(flags) {
  * `keys` sub-commands. Listed explicitly so an unknown verb says what is
  * actually available rather than printing the whole CLI help.
  */
-function runKeys(args, flags) {
+async function runKeys(args, flags) {
   const [action, ...rest] = args;
   switch (action) {
     case 'import':
@@ -217,6 +219,14 @@ function runKeys(args, flags) {
     case 'list':
     case 'ls':
       listKeys(rest[0]);
+      break;
+    case 'check':
+      await checkKeysCommand(rest[0], {
+        balance: Boolean(flags.balance),
+        concurrency: Number(flags.concurrency) || undefined,
+        low: flags.low === undefined ? undefined : Number(flags.low),
+        timeoutMs: Number(flags.timeout) ? Number(flags.timeout) * 1000 : undefined
+      });
       break;
     case 'next':
       nextKey(rest[0]);
@@ -232,8 +242,8 @@ function runKeys(args, flags) {
       break;
     default:
       throw new UsageError(
-        action ? `Unknown keys command: '${action}'` : 'Usage: ai-proxy keys <import|list|next|use|retire|revive>',
-        'Available: import, list, next, use, retire, revive'
+        action ? `Unknown keys command: '${action}'` : 'Usage: ai-proxy keys <import|list|check|next|use|retire|revive>',
+        'Available: import, list, check, next, use, retire, revive'
       );
   }
 }
@@ -287,7 +297,7 @@ async function main() {
       break;
 
     case 'keys':
-      runKeys(positional.slice(1), flags);
+      await runKeys(positional.slice(1), flags);
       break;
 
     case 'test':

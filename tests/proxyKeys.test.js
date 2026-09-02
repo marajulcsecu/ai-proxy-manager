@@ -210,7 +210,7 @@ test('an error page too big to hold back is still delivered whole', async () => 
 
 test('a caller who supplies their own key is not charged against the pool', async () => {
   seedPool();
-  const response = await call('/v1/messages?route=spent', { 'x-api-key': `gorouter:${'sk-someone-elses-key-00000000'}` });
+  const response = await call('/v1/messages?route=spent', { 'x-api-key': `gorouter:${'sk-caller-supplied-00000000000'}` });
 
   assert.equal(response.status, 403);
   assert.equal(pool().keys[0].status, 'active', 'the key that failed was not one of ours');
