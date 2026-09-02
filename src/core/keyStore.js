@@ -109,11 +109,40 @@ export function normalizeKeyPool(rawKeys, legacyApiKey = '') {
  * @param {Array<Object>} keys
  * @returns {Object|null}
  */
-export function selectKey(keys) {
+export function selectKey(keys, selectedId = '') {
   if (!Array.isArray(keys) || !keys.length) return null;
+
+  // An explicit selection is the user's decision and outranks every status,
+  // including `exhausted`: rotation is a click, not a side effect of a verdict.
+  // The exception is a key that can never work again, whatever is added to it.
+  if (selectedId) {
+    const chosen = keys.find(k => k.id === selectedId);
+    if (chosen && chosen.status !== 'invalid' && chosen.status !== 'disabled') return chosen;
+  }
+
   return keys.find(k => k.status === 'active')
     || keys.find(k => k.status === 'unknown')
     || keys[0];
+}
+
+/** True for a key worth sending: not spent, not revoked, not switched off. */
+const usable = key => key && !['exhausted', 'invalid', 'disabled'].includes(key.status);
+
+/**
+ * Id of the next key to try after `currentId`, draining the pool in order.
+ *
+ * Sequential and deliberately without a wrap-around: reaching the end means the
+ * provider is out of accounts, which the caller must be able to see rather than
+ * having it loop back onto keys it has already rejected.
+ * @param {Array<Object>} keys
+ * @param {string|null} currentId - null to start from the top
+ * @returns {string|null}
+ */
+export function nextKeyId(keys, currentId) {
+  if (!Array.isArray(keys) || !keys.length) return null;
+  const from = currentId ? keys.findIndex(k => k.id === currentId) : -1;
+  for (let i = from + 1; i < keys.length; i++) if (usable(keys[i])) return keys[i].id;
+  return null;
 }
 
 /**
@@ -121,8 +150,63 @@ export function selectKey(keys) {
  * @param {Array<Object>} keys
  * @returns {string}
  */
-export function selectKeyValue(keys) {
-  return selectKey(keys)?.key ?? '';
+export function selectKeyValue(keys, selectedId = '') {
+  return selectKey(keys, selectedId)?.key ?? '';
+}
+
+/**
+ * Records what an upstream failure means for one key.
+ *
+ * Only a verdict about the key itself changes its status; a Cloudflare page or a
+ * rate limit is written to `lastError` and nothing else, because the key is not
+ * the problem. The selection is never moved here — see selectKey().
+ *
+ * @param {Object} config - normalized config; not mutated
+ * @param {string} providerName
+ * @param {string} keyId
+ * @param {import('./creditSignals.js').UpstreamVerdict|null} verdict
+ * @returns {{config: Object, changed: boolean, entry: Object|null, status: string|null}}
+ *          `changed` is true only when the key's status moved, i.e. when there
+ *          is something to tell the user about.
+ */
+export function applyKeyVerdict(config, providerName, keyId, verdict) {
+  const provider = config?.providers?.[providerName];
+  const index = provider ? (provider.keys || []).findIndex(k => k.id === keyId) : -1;
+  if (!verdict || index < 0) return { config, changed: false, entry: null, status: null };
+
+  const status = verdict.kind === 'exhausted' ? 'exhausted'
+    : verdict.kind === 'invalid-key' ? 'invalid'
+      : null;
+
+  const before = provider.keys[index];
+  const entry = {
+    ...before,
+    status: status || before.status,
+    lastError: [verdict.status || '', verdict.matched || verdict.kind].filter(Boolean).join(' ') || null,
+    ...(verdict.remaining === null || verdict.remaining === undefined ? {} : { remaining: verdict.remaining }),
+    ...(verdict.needed === null || verdict.needed === undefined ? {} : { needed: verdict.needed })
+  };
+
+  const keys = [...provider.keys];
+  keys[index] = entry;
+  const changed = Boolean(status) && status !== before.status;
+
+  // Out of credit is a judgement, so the key stays in service until the user
+  // switches: pin the selection to it, or the mirror would quietly slide to the
+  // next key — auto-rotation by accident. A revoked key is a fact, not a
+  // judgement, so it is never pinned.
+  const pinned = changed && status === 'exhausted' ? keyId : (provider.selectedKeyId || '');
+  const selectedKeyId = keys.some(k => k.id === pinned) ? pinned : '';
+
+  const next = {
+    ...config,
+    providers: {
+      ...config.providers,
+      [providerName]: { ...provider, keys, selectedKeyId, apiKey: selectKeyValue(keys, selectedKeyId) }
+    }
+  };
+
+  return { config: next, changed, entry, status };
 }
 
 // --- the vault --------------------------------------------------------------

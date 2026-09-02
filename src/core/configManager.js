@@ -166,10 +166,16 @@ export function normalizeConfig(raw) {
     // the tester, the dashboard and the <provider>:<key> inline token.
     const keys = normalizeKeyPool(data.keys, data.apiKey);
 
+    // A selection pointing at a key that is no longer in the pool would leave
+    // the provider with no usable mirror, so it is dropped rather than kept.
+    const selectedKeyId = String(data.selectedKeyId ?? '').trim();
+    const selected = keys.some(k => k.id === selectedKeyId) ? selectedKeyId : '';
+
     out.providers[name] = {
       url: String(data.url ?? '').trim(),
-      apiKey: selectKeyValue(keys),
+      apiKey: selectKeyValue(keys, selected),
       keys,
+      selectedKeyId: selected,
       defaultModel,
       models,
       ...(data.note ? { note: String(data.note) } : {})
