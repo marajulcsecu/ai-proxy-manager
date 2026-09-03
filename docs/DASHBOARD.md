@@ -5,11 +5,20 @@ CSS and JavaScript: no framework, no bundler, no dependencies, nothing to build.
 page and your edit is live.
 
 > This file replaces the original `DASHBOARD_PLAN.md`, which described the MVP before it was
-> built. Everything below describes what actually ships in v1.1.0.
+> built. Everything below describes what actually ships in v1.1.0, plus the key pool, which
+> is unreleased.
 
 ---
 
 ## Views
+
+Above every view sits the **key-credit banner**, hidden until a key runs out. It rides on the
+same 2-second status poll as the tiles, so an account that empties mid-request is on screen
+seconds later: *"gorouter key marajul.cu.cse is out of credit ($0.71 left, $0.80 needed)"*
+with a *Switch →* button. When a provider is in `auto` mode the same alert reads as news —
+"Switched to … automatically", no button — because the pool has already moved on; it stays
+until dismissed, so a switch that happened while you were away is not lost. A revoked key
+(`401`) is shown in red instead, and never triggers automatic rotation.
 
 ### Overview
 
@@ -27,6 +36,15 @@ chips, and the actions *Use this*, *Test*, *Edit*, *+ Model*, delete. **Test** s
 1-token request and reports the verdict inline. **Test all** runs them in parallel.
 
 A card is outlined green when active and red when its URL cannot be parsed.
+
+A provider holding more than one account also gets a **Pool** row: the account in use with
+its last known balance, a `N keys · N spent · N dead` count, *next key*, *retire*, and an
+`auto` toggle that decides who switches when an account runs out — the banner and you
+(`manual`, the default), or the proxy inside the request that found it empty (`auto`). Turning
+`auto` on is worth doing only after `ai-proxy keys check` has shown what that relay actually
+says when a balance runs dry. Importing, checking and exporting keys stay on the CLI: the
+first two run for minutes and want streaming progress, which a 2-second poll cannot show.
+See **[KEYS.md](KEYS.md)**.
 
 ![Providers](images/dashboard-providers.png)
 

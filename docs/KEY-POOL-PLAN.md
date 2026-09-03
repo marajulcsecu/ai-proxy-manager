@@ -1,11 +1,14 @@
 # Key pool + rotation — implementation plan
 
-Status: **phases 0–6 done** (branch `feat/key-pool`). Pool schema, vault and backups; the
-.xlsx reader and importer; the classifier; live detection — the proxy reads the rejection
-body, marks the key, raises an alert and keeps serving until the user switches;
-`ai-proxy keys check --balance`, which puts a verdict and a balance on every key without
-spending anything; and now `ai-proxy keys rotation <name> auto`, which lets one provider
-switch account inside the request that found the account empty. Next: phase 7, export + docs.
+Status: **all seven phases done** (branch `feat/key-pool`, 263 tests green). Pool schema,
+vault and backups; the .xlsx reader and importer; the classifier; live detection — the proxy
+reads the rejection body, marks the key, raises an alert and keeps serving until the user
+switches; `ai-proxy keys check --balance`, which puts a verdict and a balance on every key
+without spending anything; `ai-proxy keys rotation <name> auto`, which lets one provider
+switch account inside the request that found the account empty; and `ai-proxy keys export`
+plus the documentation. What is left is not implementation but decisions: importing the real
+261 keys into the live `config.json`, restarting the daemon onto the new code, and choosing
+which providers get `auto`.
 
 One item listed under phase 4 below is still deliberately left out:
 
@@ -270,6 +273,29 @@ toggle on the provider card. 253 tests green. Five properties are worth keeping 
 
 ### Phase 7 — export + docs
 CSV export (`keys export`), `docs/KEYS.md`, README section, CHANGELOG entry.
+
+**Shipped as:** `exportKeys` in `src/controllers/keysController.js`, `ai-proxy keys export
+[file] [--with-keys] [--force]`, `docs/KEYS.md`, a README section, the CHANGELOG entry, and
+the `/api/keys*` section `docs/API.md` had never had. 263 tests green. Four properties are
+worth keeping in mind:
+
+- **A backup that cannot be restored is not a backup**, so the round trip is the test that
+  matters: the exported CSV is fed back through `parseCsv` → `extractKeyRecords` →
+  `mergeKeyRecords` and must land every key with nothing unresolved. That is also what fixes
+  the column order — the importer finds the provider as the first cell that is not a key, a
+  URL, a number or an e-mail, and the balance as the first *numeric* cell, so `Provider` has
+  to precede `Status` and no number may precede `Remaining Credit`. `requestsServed` and
+  `needed` are left out of the file for that reason alone.
+- **Masked and restorable are mutually exclusive.** `sk-fa…000a` does not match the
+  importer's key pattern, so the default export is a readable inventory, not a spare copy;
+  only `--with-keys` produces something that can be imported back.
+- **`--with-keys` refuses to write inside a git work tree** (`UsageError` naming the repo,
+  and no file created) unless `--force`. The data directory is exempt: it already holds the
+  same keys in plain text, so refusing there would only push the user somewhere worse.
+- **Deliberate deviation from §2 rule 4** ("CSV export after every mutation"): the export is
+  an explicit command instead. An automatic one would drop a full plaintext inventory into a
+  second location every time a key was marked — the vault already covers recovery, and it
+  never contains a path the user forgot about.
 
 ---
 

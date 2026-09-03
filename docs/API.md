@@ -75,13 +75,17 @@ Routing state plus traffic metrics. This is what the dashboard tiles read.
   "errorRate": 0.133,
   "errorCount": 2,
   "byProvider": { "tabitoken": { "requests": 14, "errors": 2 } },
-  "persistLogs": true
+  "persistLogs": true,
+  "keyAlerts": []
 }
 ```
 
 `ok` is `false` with a populated `configError` when `config.json` cannot be parsed — the
 daemon keeps serving so you can see why. Latency and error figures cover requests made
 since this process started; rows restored from disk are excluded.
+
+`keyAlerts` carries the accounts found to be out of credit or revoked, in the shape shown
+under [Keys](#keys). It rides on the status poll so the banner needs no request of its own.
 
 ---
 
@@ -230,6 +234,116 @@ pass-through, if the list is now empty). The response reports the resulting
 
 ---
 
+## Keys
+
+Many accounts per provider. Every response here names a key by `id`, `label` and `masked`
+(`sk-fa…000a`) — **no endpoint returns a key value**, and there is no way to ask for one.
+Importing, checking and exporting are CLI-only (`ai-proxy keys import|check|export`): the
+first two stream progress over a run that lasts minutes, the third writes a file to a chosen
+path. See [KEYS.md](KEYS.md) for the model behind all of this.
+
+### `GET /api/keys`
+
+Every pool, plus the alerts nobody has dismissed.
+
+```json
+{
+  "ok": true,
+  "providers": [
+    {
+      "name": "gorouter",
+      "total": 12, "spent": 3, "unusable": 1,
+      "selectedKeyId": "9f2c1a44",
+      "inUse": "9f2c1a44",
+      "rotation": "manual",
+      "keys": [
+        {
+          "position": 1, "id": "9f2c1a44", "masked": "sk-fa…000a",
+          "label": "marajul.cu.cse@gmail.com", "status": "active",
+          "remaining": 55.34, "needed": null,
+          "requestsServed": 41, "lastUsedAt": "2026-09-03T09:12:44.001Z", "lastError": null,
+          "dashboardUrl": "https://gorouter.app/", "referralUrl": "https://gorouter.app/…",
+          "inUse": true
+        }
+      ]
+    }
+  ],
+  "alerts": [
+    {
+      "provider": "gorouter", "keyId": "9f2c1a44", "label": "marajul.cu.cse@gmail.com",
+      "masked": "sk-fa…000a", "status": "exhausted",
+      "remaining": 0.710336, "needed": 0.8,
+      "matched": "预扣费额度失败", "statusCode": 403,
+      "switchedTo": null, "at": "2026-09-03T09:14:02.114Z"
+    }
+  ]
+}
+```
+
+`status` is one of `active`, `exhausted`, `invalid`, `unknown`, `disabled`. `remaining` and
+`needed` are the figures the provider itself quoted when it refused a request; `matched` is
+the phrase that classified it, kept so a verdict can be audited. `switchedTo` names the
+account now serving when the provider switched by itself — an alert carrying it is news, not
+a request, so render it without a *Switch* button.
+
+The same `alerts` array is on `GET /api/status` as `keyAlerts`, so the banner does not need a
+second poll.
+
+### `POST /api/keys/:name/next`
+
+Switches to the next usable key, draining the pool in order. `unknown` counts as usable;
+`exhausted`, `invalid` and `disabled` are skipped. There is no wrap-around — reaching the end
+is an error naming the provider, not a loop back onto keys already refused.
+
+```json
+{ "ok": true, "provider": "gorouter",
+  "from": { "id": "9f2c1a44", "label": "…", "masked": "sk-fa…000a", "status": "exhausted", "remaining": 0.71 },
+  "to":   { "id": "b31d0c9e", "label": "…", "masked": "sk-fa…000b", "status": "unknown",   "remaining": null } }
+```
+
+### `POST /api/keys/:name/use`
+
+`{"keyId": "b31d0c9e"}` — also accepts a position (`"2"`) or a label, under `keyId`, `key` or
+`selector`. An explicit choice outranks the key's status, `invalid` and `disabled` aside: a key
+refused for a large request can still answer a small one.
+
+### `POST /api/keys/:name/retire`
+
+Marks a key `exhausted` and switches to the next one. Body optional — `{}` retires the key in
+use. Retiring is not deleting: the entry keeps its label and balance, and its vault line is
+untouched.
+
+### `POST /api/keys/:name/revive`
+
+`{"keyId": "…"}` — puts a key back as `unknown`, to be probed again. This is how a wrong
+verdict is undone.
+
+### `POST /api/keys/:name/rotation`
+
+`{"mode": "auto"}` or `{"mode": "manual"}`. Who switches when a key runs out, per provider.
+
+```json
+{ "ok": true, "provider": "gorouter", "mode": "auto", "previous": "manual", "changed": true }
+```
+
+`changed: false` means the mode was already that, and nothing was written — an unchanged save
+would rotate the five config backups away for nothing. Omit `mode` to read the current one.
+An unknown mode is a `400` listing the two.
+
+In `auto` the provider marks the spent account, moves to the next and re-sends the refused
+request itself, so the client gets an answer rather than the `403`. It is bounded: exhaustion
+only, never a revoked key, at most three accounts per request. Turn it on only after
+`ai-proxy keys check` has shown you that relay's real wording.
+
+### `DELETE /api/keys/:name/alerts/:keyId`
+
+Dismisses one alert. `{"ok": true, "dismissed": true}`; `dismissed: false` means it had
+already gone. Alerts also clear themselves once the condition ends — a key that is no longer
+both spent and selected — because the switch may well have happened in the CLI, in another
+process.
+
+---
+
 ## Request history
 
 ### `GET /api/logs`
@@ -258,7 +372,13 @@ Newest last. Query parameters: `limit`, `provider`, and
       "statusCode": 200,
       "durationMs": 215,
       "ttfbMs": 208,
-      "error": null
+      "error": null,
+      "attempt": 1,
+      "retryReason": null,
+      "keyId": "9f2c1a44",
+      "keyLabel": "marajul.cu.cse@gmail.com",
+      "keyVerdict": null,
+      "keyRemaining": null
     }
   ]
 }
@@ -266,6 +386,13 @@ Newest last. Query parameters: `limit`, `provider`, and
 
 An entry with `statusCode: null` and no `error` is still in flight. Entries restored from
 `requests.jsonl` after a restart carry `"historical": true`.
+
+A retry, a provider failover and an automatic key switch are each logged as their own row,
+with `attempt` counting up and `retryReason` naming what went wrong on the previous one — a
+`524` and the attempt that rescued it are both visible rather than one hiding the other.
+`keyId` / `keyLabel` say which account served the request (never the key itself), and
+`keyVerdict` / `keyRemaining` are filled in when the provider refused it for credit:
+`"exhausted"` with the balance it quoted.
 
 ### `GET /api/logs/:id`
 

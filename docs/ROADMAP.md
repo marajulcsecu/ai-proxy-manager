@@ -1,7 +1,8 @@
 # Roadmap
 
-Phases 1–6 are shipped (v1.1.0). What comes after them is listed at the bottom, roughly in
-order of how much it would improve day-to-day use.
+Phases 1–6 are shipped (v1.1.0); phase 7, the key pool, is on `feat/key-pool` and unreleased.
+What comes after them is listed at the bottom, roughly in order of how much it would improve
+day-to-day use.
 
 ### Phase 1: Project Setup & Storage Engine (Completed)
 - [x] Initialize Node.js project (`package.json`, Git).
@@ -46,6 +47,21 @@ order of how much it would improve day-to-day use.
 - [x] Test suite on `node:test` (47 tests) covering config, URL resolution, the REST
       contract, the proxy flow and the logger.
 
+### Phase 7: Many keys per provider (Completed — unreleased)
+- [x] A pool of accounts per provider, each with its own status, balance and dashboard/referral
+      URL, plus an append-only vault and five rolling config backups — four independent copies,
+      so no schema change can lose a key.
+- [x] `.xlsx` reader written on `node:zlib` alone (a spreadsheet is a zip of XML), and an
+      importer that accounts for every key-shaped cell in the file or refuses to write.
+- [x] Credit detection from the refusal body, not the status code: these relays pre-authorise
+      against the balance and quote the exact shortfall, so a refusal is a free balance reading.
+- [x] Manual switching by default (a dashboard banner and `keys next`), `auto` per provider for
+      those whose refusal wording has been confirmed. Replaying is safe only because a
+      pre-authorisation refusal billed nothing.
+- [x] `keys check [--balance]`, which verdicts and prices a whole pool without spending credit,
+      and `keys export`, the CSV second copy.
+- [x] Test suite at 263 tests.
+
 ---
 
 ## Next
@@ -55,9 +71,10 @@ dependency (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
 
 ### Likely next
 
-- **Automatic failover.** When the active provider returns 429/5xx, retry once on a named
-  fallback provider and mark it in the log. Needs a `fallback` field per provider and care
-  not to double-charge a streaming request that already emitted tokens.
+- ~~**Automatic failover.**~~ Shipped, unreleased: `retryEnabled` + `failoverProviders`, and
+  the key pool walks accounts within a provider before moving to the next one. It is off by
+  default, because a retry can cost a second call — the exception is a pre-authorisation
+  refusal, which billed nothing and is the one failure the proxy replays on its own.
 - **Live log streaming.** Replace the dashboard's 2-second poll with SSE from the daemon, so
   in-flight requests appear as they start. The renderers are already diff-guarded, so this is
   a transport change.

@@ -9,7 +9,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { loadConfig, saveConfig } from '../core/configManager.js';
+import { loadConfig, saveConfig, CONFIG_DIR } from '../core/configManager.js';
 import { selectKey, nextKeyId, applyKeyVerdict, maskKey, KEY_ROTATION_MODES } from '../core/keyStore.js';
 import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, RE_KEY } from '../core/keyImport.js';
 import { checkKeys, DEFAULT_LOW } from '../core/keyCheck.js';
@@ -500,4 +500,122 @@ function reportCheck(report) {
   else Logger.dim('  Nothing changed, so nothing was written.');
   if (!report.balance && totals.live) Logger.dim('  "Usable" here only means the key is accepted — run with --balance to see the credit.');
   for (const note of report.notes) Logger.warn(note);
+}
+
+// --- export: the second copy -------------------------------------------------
+
+/**
+ * Columns of the exported CSV, in the order the importer reads a row.
+ *
+ * The order is not cosmetic. `extractKeyRecords` identifies a row-per-provider
+ * row by content: the provider is the first cell that is not a key, a URL, a
+ * number or an e-mail, and the balance is the first numeric cell. So the
+ * provider must come before `Status`, and no other number may come before
+ * `Remaining Credit` — which is why `requestsServed` is not a column here.
+ * The names match the account inventory's own headers so rows can be pasted
+ * between the two files.
+ */
+const EXPORT_HEADER = ['Provider', 'Account', 'API Key:', 'Status', 'Remaining Credit', 'URL For API KEY', 'Referral Link'];
+
+/** One CSV field: quoted only when it has to be. */
+function csvField(value) {
+  const text = value === null || value === undefined ? '' : String(value);
+  return /[",\r\n]|^\s|\s$/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+/**
+ * Nearest enclosing git working tree, or null.
+ *
+ * A `.git` entry may be a directory or, in a worktree or submodule, a file.
+ * Either one means `git add .` can reach this path.
+ * @param {string} dir
+ * @returns {string|null}
+ */
+function gitRootAbove(dir) {
+  let at = path.resolve(dir);
+  for (;;) {
+    if (fs.existsSync(path.join(at, '.git'))) return at;
+    const up = path.dirname(at);
+    if (up === at) return null;
+    at = up;
+  }
+}
+
+/** True when `target` sits inside the tool's own data directory. */
+function insideConfigDir(target) {
+  const relative = path.relative(CONFIG_DIR, target);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/**
+ * Writes the whole key inventory to a CSV file.
+ *
+ * This is the second copy the plan calls for: `config.json` is the source of
+ * truth, `keys.jsonl` is the append-only history, and this is the one artefact
+ * that leaves the data directory. It is written on request rather than after
+ * every mutation, because an automatic write would drop a full plaintext key
+ * inventory into a second place every time a key was marked.
+ *
+ * @param {string} [filePath] - defaults to keys-<date>.csv beside the config
+ * @param {{withKeys?: boolean, force?: boolean}} [options]
+ * @returns {{file: string, keys: number, providers: number, withKeys: boolean}}
+ */
+export function exportKeys(filePath, options = {}) {
+  const config = loadConfig();
+  const withKeys = Boolean(options.withKeys);
+
+  const target = filePath
+    ? path.resolve(filePath)
+    : path.join(CONFIG_DIR, `keys-${new Date().toISOString().slice(0, 10)}.csv`);
+
+  // A masked file is not a secret, and the data directory already holds these
+  // keys in plain text — refusing there would only send the user somewhere worse.
+  if (withKeys && !options.force && !insideConfigDir(target)) {
+    const repo = gitRootAbove(path.dirname(target));
+    if (repo) {
+      throw new UsageError(
+        `${target} is inside the git repository at ${repo} — a file with real keys does not belong there.`,
+        'Write it outside the repository, drop --with-keys for a masked copy, or add --force if you are certain.'
+      );
+    }
+  }
+
+  const lines = [EXPORT_HEADER.map(csvField).join(',')];
+  let count = 0;
+  for (const [name, provider] of Object.entries(config.providers)) {
+    for (const entry of provider.keys || []) {
+      lines.push([
+        name,
+        entry.label,
+        withKeys ? entry.key : maskKey(entry.key),
+        entry.status,
+        entry.remaining === null || entry.remaining === undefined ? '' : entry.remaining,
+        entry.dashboardUrl,
+        entry.referralUrl
+      ].map(csvField).join(','));
+      count++;
+    }
+  }
+
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(target, `${lines.join('\n')}\n`, { encoding: 'utf8', mode: 0o600 });
+  // writeFileSync only applies its mode when it creates the file, so a file
+  // that already existed keeps whatever permissions it had.
+  fs.chmodSync(target, 0o600);
+
+  const result = { file: target, keys: count, providers: Object.keys(config.providers).length, withKeys };
+  reportExport(result);
+  return result;
+}
+
+/** Says what was written and how dangerous it is. */
+function reportExport(result) {
+  if (!result.keys) {
+    Logger.info(`No keys to export — wrote the header alone to ${result.file}`);
+    Logger.dim('  Import some first: ai-proxy keys import <file.xlsx>');
+    return;
+  }
+  Logger.success(`Exported ${result.keys} key(s) from ${result.providers} provider(s) to ${result.file}`);
+  if (result.withKeys) Logger.warn('This file contains API keys in plain text. Keep it out of git and off shared drives.');
+  else Logger.dim('  Keys were masked. Use --with-keys for a copy you could restore from.');
 }

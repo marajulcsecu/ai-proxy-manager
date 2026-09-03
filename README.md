@@ -36,7 +36,8 @@ curl ────────┘         ▲
 ## Contents
 
 - [Why](#why) · [Install](#install) · [Quick start](#quick-start)
-- [Dashboard](#dashboard) · [Commands](#commands) · [How routing works](#how-routing-works)
+- [Dashboard](#dashboard) · [Commands](#commands) · [Many keys per provider](#many-keys-per-provider)
+- [How routing works](#how-routing-works)
 - [Configuration](#configuration) · [Security](#security) · [Documentation](#documentation)
 
 ## Why
@@ -123,8 +124,41 @@ anywhere. Light and dark themes follow your system by default. More:
 | `status` · `logs [-n N] [-f]` | State overview · daemon log |
 | `set-port <n>` | Change the listening port |
 | `setup-terminal` · `remove-terminal` · `sync-vscode` | Tool integrations |
+| `keys <import\|list\|check\|next\|use\|retire\|revive\|rotation\|export>` | Many accounts per provider — see [below](#many-keys-per-provider) |
 | `export <file> [--with-keys]` · `import <file> [--replace]` | Move config between machines |
 | `help` · `version` | |
+
+## Many keys per provider
+
+If you hold several accounts with the same relay, the proxy holds all of their keys, sends
+one, and notices when that account runs out of credit.
+
+```bash
+ai-proxy keys import ~/accounts.xlsx --dry-run   # read the spreadsheet, write nothing
+ai-proxy keys check --balance                    # what is each key worth, without spending
+ai-proxy keys list gorouter                      # the pool, with the key in use marked
+ai-proxy keys next gorouter                      # switch account by hand
+ai-proxy keys rotation gorouter auto             # …or let that provider do it itself
+ai-proxy keys export ~/keys-backup.csv --with-keys
+```
+
+Detection is not a guess about billing. These relays pre-authorise a request against the
+balance and refuse it *before* running it, quoting the shortfall — so a `403` carrying
+`用户剩余额度: ＄0.71` is a free, exact balance reading. Nothing was billed, which is also why
+that one request can safely be re-sent on the next account. A `403` from a WAF, a `429` and a
+`401` are explicitly *not* treated as exhaustion; mistaking any of them for "spent" would
+retire a healthy account.
+
+Default is **manual**: the dashboard shows *"gorouter key marajul.cu.cse is out of credit
+($0.71 left)"* with a Switch button, and until you click, requests keep going to that key.
+`keys rotation <name> auto` lets one provider switch and re-send by itself, bounded to three
+accounts per request.
+
+Keys are kept in four places so they cannot be lost: `config.json`, its five rotating
+backups, the append-only `keys.jsonl` vault, and the CSV you export. No API or page ever
+returns a key value.
+
+Full reference: **[docs/KEYS.md](docs/KEYS.md)**.
 
 ## How routing works
 
@@ -157,6 +191,8 @@ Everything lives in `~/.config/ai-proxy-manager/`:
 | `daemon.pid` | Lets `stop` / `status` / `restart` find the daemon |
 | `daemon.log` | Output of a backgrounded daemon; `ai-proxy logs -f` follows it |
 | `requests.jsonl` | Request **metadata** history, rotated at 5 MB. Never holds prompts. |
+| `keys.jsonl` | Append-only record of every key ever saved. Mode `0600`. |
+| `config.json.bak.1…5` | The five previous configs, rotated on every write |
 
 Set `AI_PROXY_HOME` to run an isolated second instance — useful when the main one is carrying
 traffic you care about:
@@ -192,6 +228,7 @@ Full detail, including one historical key exposure in this repository's git hist
 | [docs/CONTEXT.md](docs/CONTEXT.md) | Architecture and internals — start here to contribute |
 | [docs/API.md](docs/API.md) | REST API reference with examples |
 | [docs/DASHBOARD.md](docs/DASHBOARD.md) | The dashboard, and the rules for editing it |
+| [docs/KEYS.md](docs/KEYS.md) | Many keys per provider: import, detection, rotation, backups |
 | [docs/SRS.md](docs/SRS.md) · [docs/ROADMAP.md](docs/ROADMAP.md) | Requirements · what is shipped and what is next |
 | [CONTRIBUTING.md](CONTRIBUTING.md) · [CHANGELOG.md](CHANGELOG.md) | How to help · what changed |
 

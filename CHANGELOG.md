@@ -43,6 +43,62 @@ All notable changes to this project are documented here. The format follows
   edge timeout (Cloudflare's is 100–120s) to fail fast with a readable error instead of
   waiting for an HTML error page.
 
+- **Many keys per provider, with credit detection** — a provider now holds a pool of accounts
+  instead of a single key, and the proxy notices when one runs out. Full reference:
+  [docs/KEYS.md](docs/KEYS.md).
+
+  *Detection.* New-API / One-API relays pre-authorise a request against the balance and refuse
+  it **before** running it, quoting the shortfall: `403` with
+  `预扣费额度失败, 用户剩余额度: ＄0.710336, 需要预扣费额度: ＄0.800000`. The status alone is
+  worthless — `403` is also a WAF block, a geo block and a revoked key — so `creditSignals.js`
+  classifies the body into `exhausted` / `invalid-key` / `rate-limited` / `transient` / `other`
+  in two confidence tiers, records which phrase fired, and parses the numbers (fullwidth `＄`
+  included). `429`, a bare `403`, `无可用渠道` and `5xx` are explicitly never read as
+  exhaustion; mistaking one of them for "spent" would retire a healthy account. Every such
+  refusal is therefore a free, exact balance reading, and no billing endpoint is needed.
+
+  *On the request path.* A `401`/`402`/`403`/`429` response is held back (up to 64 KB),
+  classified, then delivered. The key is marked, `remaining` is recorded, the request row gains
+  `keyId`, `keyLabel`, `keyVerdict` and `keyRemaining`, and the dashboard raises a banner.
+  Nothing is written to disk for a WAF `403`, a `429` or a repeat of a verdict already on file.
+
+  *Switching.* Manual by default: you are told, and requests keep going to that key until you
+  click *Switch →* or run `ai-proxy keys next <provider>`. `ai-proxy keys rotation <provider>
+  auto` lets one provider mark the account spent, move to the next and re-send the refused
+  request itself — safe precisely because a pre-authorisation refusal billed nothing. Auto is
+  bounded: exhaustion only (never `invalid-key`, or a relay having a bad `401` day would mark
+  the whole pool revoked), a verified wording or a second sighting of an unverified one, at
+  most three accounts per request, and never for a request whose body was streamed.
+
+  *Importing.* `ai-proxy keys import <file…> [--dry-run]` reads the account spreadsheets
+  directly — `.xlsx` is a zip of XML, parsed with `node:zlib`, so this adds no dependency —
+  and handles both real layouts (a row per provider, a column per provider). It never guesses
+  a provider: an unresolvable key is reported with the header that produced it. It counts the
+  key-shaped cells in the file independently of its own parsing and **refuses to write at all**
+  if a single one went unaccounted for. Imported keys arrive as `unknown`, behind the key
+  already in use, and a balance the proxy measured is never overwritten by one typed into a
+  sheet.
+
+  *Checking.* `ai-proxy keys check [name] [--balance] [--concurrency N] [--low N]` probes every
+  key: `GET /v1/models` for liveness, and — opt-in — a `max_tokens: 1000000` ping that no
+  balance can pre-pay, so the relay refuses it and hands back the number. `stream: true` plus a
+  socket destroyed on the first byte is what caps the cost if a key *is* rich enough to be
+  accepted. Liveness can promote `unknown` → `active` but never revives a spent key, a control
+  probe with an invented key catches relays that accept anything, and `disabled` is a decision
+  a measurement does not undo.
+
+  *Not losing keys.* Four copies: `config.json` (atomic, `0600`), its five rotating backups,
+  the append-only `keys.jsonl` vault that `config.json` can be rebuilt from, and
+  `ai-proxy keys export [file] [--with-keys]` — a CSV in the same column order the importer
+  reads, so it is a genuine restore. The export is masked unless asked, `0600`, and refused
+  inside a git working tree unless forced. Nothing is ever deleted: spent and revoked keys stay
+  in the pool, and no API or page returns a key value.
+
+  *Commands and API.* `keys import|list|check|next|use|retire|revive|rotation|export`,
+  `GET /api/keys`, `POST /api/keys/:name/{next,use,retire,revive,rotation}`,
+  `DELETE /api/keys/:name/alerts/:keyId`, `keyAlerts` on `/api/status`, and per-provider pool
+  cards with an `auto` toggle in the dashboard.
+
 ## [1.1.0] — 2026-08-28
 
 A hardening release. The proxy engine, configuration layer, REST API and dashboard were
