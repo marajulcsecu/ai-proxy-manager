@@ -17,7 +17,7 @@ const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-proxy-rotatecli-'));
 process.env.AI_PROXY_HOME = home;
 process.env.AI_PROXY_QUIET = '1';
 
-const { listKeys, nextKey, useKey, retireKey, reviveKey } =
+const { listKeys, nextKey, useKey, retireKey, reviveKey, setRotation } =
   await import('../src/controllers/keysController.js');
 const { saveConfig, loadConfig, clearConfigCache } = await import('../src/core/configManager.js');
 const { deriveKeyId } = await import('../src/core/keyStore.js');
@@ -142,4 +142,74 @@ test('a provider with no keys says so instead of failing', () => {
   seed([]);
   assert.deepEqual(listKeys('gorouter'), []);
   assert.throws(() => nextKey('gorouter'), /no key/i);
+});
+
+// --- who does the switching --------------------------------------------------
+//
+// The mode is per provider on purpose: it is only safe to hand a provider the
+// keys to its own pool once `keys check` has shown what its refusals look like.
+
+test('a provider does its switching by hand until it is told otherwise', () => {
+  seed([{ key: A }, { key: B }]);
+
+  const result = setRotation('gorouter');
+
+  assert.equal(result.mode, 'manual');
+  assert.equal(result.changed, false, 'asking is not setting');
+  assert.equal(reload().keyRotation, 'manual');
+});
+
+test('auto is stored on the provider that asked for it, and on no other', () => {
+  clearConfigCache();
+  saveConfig({
+    providers: {
+      gorouter: { url: 'https://gorouter.app/v1', keys: [{ key: A }] },
+      tabitoken: { url: 'https://tabitoken.com/v1', keys: [{ key: B }] }
+    }
+  });
+  clearConfigCache();
+
+  const result = setRotation('gorouter', 'auto');
+
+  assert.deepEqual({ mode: result.mode, previous: result.previous, changed: result.changed },
+    { mode: 'auto', previous: 'manual', changed: true });
+  const config = loadConfig({ fresh: true });
+  assert.equal(config.providers.gorouter.keyRotation, 'auto');
+  assert.equal(config.providers.tabitoken.keyRotation, 'manual', 'one provider at a time');
+});
+
+test('setting the mode it already has writes nothing', () => {
+  seed([{ key: A }], { keyRotation: 'auto' });
+  const before = fs.statSync(path.join(home, 'config.json')).mtimeMs;
+
+  const result = setRotation('gorouter', 'auto');
+
+  assert.equal(result.changed, false);
+  assert.equal(fs.statSync(path.join(home, 'config.json')).mtimeMs, before,
+    'a no-op save would rotate the backups for nothing');
+});
+
+test('going back to manual is a change like any other', () => {
+  seed([{ key: A }], { keyRotation: 'auto' });
+
+  const result = setRotation('gorouter', 'manual');
+
+  assert.equal(result.changed, true);
+  assert.equal(reload().keyRotation, 'manual');
+});
+
+test('a mode nobody recognises is refused rather than guessed at', () => {
+  seed([{ key: A }], { keyRotation: 'auto' });
+
+  assert.throws(() => setRotation('gorouter', 'automatic'), UsageError);
+  assert.throws(() => setRotation('gorouter', 'automatic'), error => /manual|auto/.test(error.hint));
+  assert.equal(reload().keyRotation, 'auto', 'a refused change leaves the provider alone');
+});
+
+test('the pool listing says which mode the provider is on', () => {
+  seed([{ key: A }, { key: B }], { keyRotation: 'auto' });
+
+  const rows = listKeys('gorouter');
+
+  assert.deepEqual(rows.map(row => row.keyRotation), ['auto', 'auto']);
 });

@@ -256,20 +256,33 @@ const RETRYABLE_STATUS = new Set([502, 503, 504, 520, 521, 522, 523, 524, 525, 5
 const RETRY_PEEK_BYTES = 64 * 1024;
 
 /**
+ * Accounts one request may try after the first when a provider is on auto
+ * rotation. A pre-authorisation refusal costs nothing, but a relay wording an
+ * outage as one would otherwise let a single request walk the entire inventory
+ * marking every account spent. Three is enough to get past a genuinely empty
+ * account or two; the rest of the pool waits for `ai-proxy keys check`.
+ */
+const MAX_KEY_WALK = 3;
+
+/**
  * Forwards one request upstream and streams the response back.
  *
  * Resolves with `{ delivered: true }` once the client has been written to —
  * from that moment the exchange is final. Resolves with `{ delivered: false,
  * reason, statusCode }` when the attempt failed before a single byte reached
- * the client, which is the only situation where retrying is safe.
+ * the client, which is the only situation where retrying is safe. `rotatedTo`
+ * on that result names the key the pool switched to while this attempt was in
+ * flight: the caller must send the request again on that account.
  *
  * @param {import('http').IncomingMessage} clientReq
  * @param {import('http').ServerResponse} clientRes
- * @param {Object} context
- * @returns {Promise<{delivered:boolean, reason?:string, statusCode?:number|null}>}
+ * @param {Object} context - `canRetry` allows holding a gateway error back for
+ *   another provider; `canWalk` allows holding a *refusal* back so an auto
+ *   provider can answer from its next account.
+ * @returns {Promise<{delivered:boolean, reason?:string, statusCode?:number|null, rotatedTo?:string|null}>}
  */
 function forward(clientReq, clientRes, context) {
-  const { target, headers, body, logId, settings, providerName, canRetry, keyId } = context;
+  const { target, headers, body, logId, settings, providerName, canRetry, canWalk, keyId } = context;
   const transport = target.isTls ? https : http;
   let bytesOut = 0;
   let settled = false;
@@ -288,7 +301,14 @@ function forward(clientReq, clientRes, context) {
       clearTimeout(stallTimer);
       finishRequest(logId, { bytesOut, ...result });
       resolve(retry
-        ? { delivered: false, reason: retry.reason, statusCode: retry.statusCode ?? null }
+        ? {
+          delivered: false,
+          reason: retry.reason,
+          statusCode: retry.statusCode ?? null,
+          // Set only by an auto rotation: the caller must send this request
+          // again, on the account the pool has just switched to.
+          rotatedTo: retry.rotatedTo ?? null
+        }
         : { delivered: true });
     };
 
@@ -431,18 +451,35 @@ function forward(clientReq, clientRes, context) {
 
         if (inspecting && !clientRes.headersSent) {
           const rejection = Buffer.concat(peeked);
-          // Answered first, so reading the body costs the client nothing but
-          // the round trip it already made.
-          deliverHeld();
+          // Classified before the client is answered, because in auto mode the
+          // verdict decides whether this response is the one the client gets at
+          // all. The body is already complete and the classifier is a handful of
+          // regexes, so the wait is a fraction of the round trip just made.
           const noted = noteUpstreamFailure({
             provider: providerName, keyId, statusCode: proxyRes.statusCode, body: rejection
           });
-          finish({
+          const outcome = {
             statusCode: proxyRes.statusCode,
             streaming: isStream,
             keyVerdict: noted.status,
             keyRemaining: noted.status ? noted.verdict.remaining : null
-          });
+          };
+
+          // The pool moved on: nothing was billed for a refusal made before the
+          // request ran, so the same request goes out again on the new account
+          // and this response is never delivered.
+          if (canWalk && noted.rotated) {
+            const spent = noted.entry.label || noted.entry.id.slice(0, 8);
+            finish(outcome, {
+              reason: `key ${spent} is out of credit`,
+              statusCode: proxyRes.statusCode,
+              rotatedTo: noted.rotated.toKeyId
+            });
+            return;
+          }
+
+          deliverHeld();
+          finish(outcome);
           return;
         }
 
@@ -494,7 +531,8 @@ function forward(clientReq, clientRes, context) {
  * @param {string} search
  */
 async function handleProxy(clientReq, clientRes, pathname, search) {
-  const { ok, config, error } = tryLoadConfig();
+  // `config` is reassigned when an auto rotation rewrites it mid-request.
+  let { ok, config, error } = tryLoadConfig();
   if (!ok) {
     Logger.error(error.message);
     return sendProxyError(clientRes, 500, error.message, 'config_error');
@@ -528,25 +566,37 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
   // A body we did not buffer is streamed straight through, so it is gone once
   // the first attempt has consumed it — such a request can never be retried.
   const replayable = raw !== null || !hasRequestBody(clientReq);
-  const plan = replayable ? buildAttemptPlan(config, route.name) : [route.name];
+  // A queue, not a fixed list: an auto-rotating provider that switches account
+  // while this request is in flight puts the new account at the front of it.
+  const queue = replayable
+    ? buildAttemptPlan(config, route.name)
+    : [{ provider: route.name, keyId: null }];
   const client = String(clientReq.headers['x-client-name'] || clientReq.headers['user-agent'] || '').slice(0, 120);
   let retryReason = null;
+  let attempt = 0;
+  let walked = 0;
 
-  for (let attempt = 1; attempt <= plan.length; attempt++) {
-    const candidate = plan[attempt - 1];
-    const isLast = attempt === plan.length;
+  while (queue.length) {
+    const { provider: candidate, keyId: wantedKeyId } = queue.shift();
+    attempt++;
+    const pool = config.providers[candidate]?.keys || [];
     // Only the first hop may fall back to the caller's own key; a failover
     // provider must use its own, or it would authenticate as the wrong user.
-    const apiKey = attempt === 1 ? route.key : (config.providers[candidate]?.apiKey || null);
+    // A step that names a key is one a rotation put here, so it wins over the
+    // mirror — falling back to which is what keeps a vanished key from
+    // stranding the request with nothing to send.
+    const apiKey = wantedKeyId
+      ? (pool.find(entry => entry.id === wantedKeyId)?.key || config.providers[candidate]?.apiKey || null)
+      : (attempt === 1 ? route.key : (config.providers[candidate]?.apiKey || null));
     // Which pool entry that key is, if any: a caller-supplied inline key
     // belongs to no pool, and nothing that happens to it may be recorded
     // against one of ours.
-    const keyEntry = (config.providers[candidate]?.keys || []).find(entry => entry.key === apiKey) || null;
+    const keyEntry = pool.find(entry => entry.key === apiKey) || null;
     const step = prepareAttempt({ config, candidate, clientReq, pathname, search, raw, settings, apiKey });
 
     if (!step.ok) {
       // A misconfigured failover target is skipped rather than fatal.
-      if (!isLast) {
+      if (queue.length) {
         Logger.warn(`[${candidate}] skipped — ${step.message}`);
         continue;
       }
@@ -583,15 +633,33 @@ async function handleProxy(clientReq, clientRes, pathname, search) {
 
     const result = await forward(clientReq, clientRes, {
       target, headers, body, logId, settings, providerName: candidate,
-      canRetry: !isLast, keyId: keyEntry?.id || null
+      canRetry: queue.length > 0,
+      // Walking is bounded per request, and a body we could not buffer cannot
+      // be sent a second time however sure the verdict is.
+      canWalk: replayable && walked < MAX_KEY_WALK,
+      keyId: keyEntry?.id || null
     });
 
     if (result.delivered) return;
 
     // Nothing reached the client, so another provider may still answer.
     retryReason = result.reason;
-    const next = plan[attempt];
-    Logger.warn(`[${candidate}] attempt ${attempt} failed (${result.reason}) — retrying with ${next}`);
+
+    if (result.rotatedTo) {
+      // The pool switched account, so this provider gets another turn on the
+      // new one. Re-read the config the monitor has just written, or the
+      // mirror here would still name the account that is out of credit.
+      walked++;
+      const reloaded = tryLoadConfig();
+      if (reloaded.ok) config = reloaded.config;
+      queue.unshift({ provider: candidate, keyId: result.rotatedTo });
+    }
+
+    const next = queue[0];
+    Logger.warn(`[${candidate}] attempt ${attempt} failed (${result.reason})`
+      + (next
+        ? ` — retrying with ${next.keyId ? `the next ${candidate} account` : next.provider}`
+        : ''));
   }
 }
 
@@ -607,25 +675,31 @@ function hasRequestBody(req) {
 }
 
 /**
- * Ordered provider names to try for one request: the resolved provider first,
- * then each configured failover target. Returns a single entry unless retrying
- * is switched on.
+ * Ordered steps to try for one request: the resolved provider first, then each
+ * configured failover target. Returns a single step unless retrying is switched
+ * on.
+ *
+ * A step is `{provider, keyId}`. `keyId` is null here — the plan chooses
+ * providers, and which account a provider uses is the pool's business. Auto
+ * rotation fills it in at the moment it switches, adding a step for the account
+ * it moved to.
  * @param {Object} config
  * @param {string} primary - resolved provider name
- * @returns {string[]}
+ * @returns {Array<{provider: string, keyId: string|null}>}
  */
 export function buildAttemptPlan(config, primary) {
+  const step = provider => ({ provider, keyId: null });
   const { retryEnabled, retryMaxAttempts, failoverProviders } = config.settings;
-  if (!retryEnabled || retryMaxAttempts < 2) return [primary];
+  if (!retryEnabled || retryMaxAttempts < 2) return [step(primary)];
 
-  const plan = [primary];
+  const plan = [step(primary)];
   for (const name of failoverProviders) {
     if (plan.length >= retryMaxAttempts) break;
-    if (name !== primary && config.providers[name]) plan.push(name);
+    if (name !== primary && config.providers[name]) plan.push(step(name));
   }
   // No usable failover target configured: try the same provider again, which
   // still helps against a one-off gateway hiccup.
-  while (plan.length < retryMaxAttempts && plan.length < 2) plan.push(primary);
+  while (plan.length < retryMaxAttempts && plan.length < 2) plan.push(step(primary));
   return plan;
 }
 

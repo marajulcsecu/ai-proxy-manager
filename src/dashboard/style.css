@@ -915,6 +915,12 @@ pre.code.is-command { color: var(--accent); white-space: pre; }
   border-color: color-mix(in srgb, var(--warn) 30%, transparent);
   color: var(--warn);
 }
+/* An automatic switch already happened: worth reading, not worth alarm. */
+.key-alert.is-info {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--accent);
+}
 .key-alert.is-danger {
   background: var(--danger-soft);
   border-color: color-mix(in srgb, var(--danger) 30%, transparent);

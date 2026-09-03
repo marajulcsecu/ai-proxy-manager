@@ -234,3 +234,132 @@ test('folding usage in twice does not double-count', () => {
 
   assert.equal(fresh().keys[0].requestsServed, 1);
 });
+
+// --- auto mode, per provider -------------------------------------------------
+//
+// Opt-in, because it acts without asking. Two rules keep it from being a way to
+// lose a pool: only a verdict the classifier is confident about may move the
+// selection, and a key that is merely rejected — a WAF page, a 401 the relay is
+// having a bad day about — never may.
+
+/** The same two-key pool, with the provider switched to auto rotation. */
+function seedAuto(keys) {
+  clearConfigCache();
+  resetKeyMonitor();
+  fs.rmSync(KEY_VAULT, { force: true });
+  return saveConfig({
+    providers: {
+      gorouter: {
+        url: 'https://gorouter.app/v1',
+        keyRotation: 'auto',
+        keys: keys || [
+          { key: KEY_A, status: 'active', label: 'a@example.com' },
+          { key: KEY_B, status: 'unknown', label: 'b@example.com' }
+        ]
+      }
+    }
+  });
+}
+
+test('an auto provider switches to the next account by itself', () => {
+  seedAuto();
+  const result = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: EXHAUSTED });
+
+  assert.equal(result.status, 'exhausted');
+  assert.deepEqual(result.rotated, { fromKeyId: ID_A, toKeyId: ID_B, toLabel: 'b@example.com' });
+
+  const provider = fresh();
+  assert.equal(provider.selectedKeyId, ID_B);
+  assert.equal(provider.apiKey, KEY_B, 'the next request goes out on the next account');
+});
+
+test('a manual provider reports no rotation, whatever the verdict', () => {
+  seed();
+  const result = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: EXHAUSTED });
+
+  assert.equal(result.rotated, null);
+  assert.equal(fresh().selectedKeyId, ID_A);
+});
+
+test('auto mode waits for a second sighting of a phrase this relay has never used', () => {
+  // Tier B wording is plausible but unconfirmed on these relays. The first
+  // sighting marks the key, which is reversible; moving the pool on the word of
+  // a phrase that has never been proven here is not what it is allowed to do.
+  seedAuto();
+  const first = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: 'insufficient quota' });
+
+  assert.equal(first.verdict.tier, 'B');
+  assert.equal(first.rotated, null);
+  assert.equal(fresh().apiKey, KEY_A, 'still pinned, exactly as manual mode would leave it');
+
+  // Second sighting, same provider: now the phrase is this relay's own wording.
+  const second = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: 'insufficient quota' });
+  assert.equal(second.priorTierBHits, 1);
+  assert.deepEqual(second.rotated, { fromKeyId: ID_A, toKeyId: ID_B, toLabel: 'b@example.com' });
+  assert.equal(fresh().apiKey, KEY_B);
+});
+
+test('a revoked key is marked but never rotated over, however the provider is set', () => {
+  // A relay having a bad 401 day would otherwise mark every account in the pool
+  // invalid, one per request, inside a minute of traffic. The selection still
+  // moves — a revoked key is never sent — but that is selectKey() skipping it,
+  // not a replay walking the pool.
+  seedAuto();
+  const result = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 401, body: '令牌无效' });
+
+  assert.equal(result.status, 'invalid');
+  assert.equal(result.rotated, null);
+  assert.equal(fresh().apiKey, KEY_B);
+});
+
+test('auto mode with nothing left to switch to keeps the last key in use', () => {
+  seedAuto([{ key: KEY_A, status: 'active', label: 'only@example.com' }]);
+  const result = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: EXHAUSTED });
+
+  assert.equal(result.rotated, null, 'nowhere to go: the user has to top this account up');
+  assert.equal(fresh().apiKey, KEY_A);
+  assert.equal(keyAlerts().length, 1, 'and the alert is the only thing that can help');
+});
+
+test('an automatic switch is still reported, and keeps being reported until dismissed', () => {
+  // In manual mode the alert is a request, so it clears itself once the user has
+  // switched. In auto mode it is news about something already done: pruning it
+  // against the selection would delete it before anyone had seen it.
+  seedAuto();
+  noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: EXHAUSTED });
+
+  const [alert] = keyAlerts();
+  assert.equal(alert.keyId, ID_A);
+  assert.equal(alert.status, 'exhausted');
+  assert.equal(alert.switchedTo, 'b@example.com', 'the banner says which account is serving now');
+  assert.ok(!JSON.stringify(alert).includes(KEY_B), 'the account that took over is named, not revealed');
+
+  assert.deepEqual(keyAlerts().map(entry => entry.keyId), [ID_A], 'the pool moved on: that is the news, not the answer');
+  assert.equal(dismissKeyAlert('gorouter', ID_A), true);
+  assert.deepEqual(keyAlerts(), []);
+});
+
+test('a manual alert still clears itself when the user switches in the CLI', () => {
+  // The other half of that rule, which must not regress: a request that has been
+  // answered elsewhere stops being shown.
+  seed();
+  noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: EXHAUSTED });
+  assert.equal(keyAlerts().length, 1);
+
+  clearConfigCache();
+  saveConfig({ ...loadConfig(), providers: { gorouter: { ...fresh(), selectedKeyId: ID_B } } });
+  assert.deepEqual(keyAlerts(), [], 'switched by hand, so the alert has been dealt with');
+});
+
+test('a switch on its own appends no vault line, because nothing about the key changed', () => {
+  // The vault records what a key *is*, so it can be recovered: which one is
+  // selected is not a fact about the key, and a line per rotation would bury the
+  // ones that matter.
+  seedAuto();
+  noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: 'insufficient quota' });
+  const before = vaultFor(ID_A).length;
+
+  const second = noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: 'insufficient quota' });
+  assert.ok(second.rotated, 'this is the sighting that moves the pool');
+  assert.equal(vaultFor(ID_A).length, before);
+});

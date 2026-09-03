@@ -8,15 +8,20 @@
  *     second 403 from a key already marked exhausted all change nothing, so
  *     they cause no write. Writing per request would rotate the config backups
  *     into uselessness within a minute of traffic.
- *  2. **A verdict never rotates a key by itself.** `applyKeyVerdict` pins the
- *     selection to the key that failed, so the proxy keeps sending it until the
- *     user switches (`ai-proxy keys next`). A wrong verdict therefore costs an
- *     alert, never a working key. Auto mode is phase 6, per provider, opt-in.
+ *  2. **A verdict never rotates a key by itself, unless it was asked to.** In
+ *     the default `manual` mode `applyKeyVerdict` pins the selection to the key
+ *     that failed, so the proxy keeps sending it until the user switches
+ *     (`ai-proxy keys next`) and a wrong verdict costs an alert rather than a
+ *     working key. A provider set to `auto` lets a *confident* verdict move the
+ *     pool on instead — Tier A wording, or Tier B wording this provider has
+ *     already used once before. Nothing else qualifies: a revoked key is marked
+ *     and skipped, never rotated over, because a relay having a bad 401 day
+ *     would otherwise walk the whole pool in a minute of traffic.
  */
 
 import { loadConfig, saveConfig } from './configManager.js';
 import { applyKeyVerdict, appendKeyVault, maskKey } from './keyStore.js';
-import { classifyUpstreamFailure } from './creditSignals.js';
+import { classifyUpstreamFailure, isConfidentExhaustion } from './creditSignals.js';
 import { Logger } from '../utils/logger.js';
 
 /** Un-dismissed alerts, keyed `provider:keyId` so one key alerts once. */
@@ -86,14 +91,17 @@ function foldUsage(config) {
  * @param {number} event.statusCode
  * @param {string|Buffer} event.body - the response body, or its peeked head
  * @returns {{verdict: import('./creditSignals.js').UpstreamVerdict,
- *   priorTierBHits: number, changed: boolean, status: string|null, entry: Object|null}}
+ *   priorTierBHits: number, changed: boolean, status: string|null,
+ *   entry: Object|null, rotated: {fromKeyId: string, toKeyId: string, toLabel: string}|null}}
+ *   `rotated` is set only when this verdict moved an auto provider on to another
+ *   key, which is also the caller's signal that the request may be replayed.
  */
 export function noteUpstreamFailure({ provider, keyId, statusCode, body }) {
   const verdict = classifyUpstreamFailure(statusCode, body);
   const priorTierBHits = tierB.get(provider) || 0;
   if (verdict.kind === 'exhausted' && verdict.tier === 'B') tierB.set(provider, priorTierBHits + 1);
 
-  const quiet = { verdict, priorTierBHits, changed: false, status: null, entry: null };
+  const quiet = { verdict, priorTierBHits, changed: false, status: null, entry: null, rotated: null };
   const actionable = verdict.kind === 'exhausted' || verdict.kind === 'invalid-key';
   if (!actionable || !provider || !keyId) return quiet;
 
@@ -105,22 +113,38 @@ export function noteUpstreamFailure({ provider, keyId, statusCode, body }) {
     return quiet;
   }
 
-  const applied = applyKeyVerdict(config, provider, keyId, verdict);
+  // Auto mode acts on its own, so it only acts on wording that has been
+  // confirmed on this provider. Exhaustion only: see the note at the top.
+  const auto = config.providers[provider]?.keyRotation === 'auto';
+  const rotate = auto && verdict.kind === 'exhausted' && isConfidentExhaustion(verdict, priorTierBHits);
+
+  const applied = applyKeyVerdict(config, provider, keyId, verdict, { rotate });
   // Not in the pool, or already in that state: nothing to write, and nothing
   // new to tell the user. `lastError` and the balance are deliberately not
   // persisted on a repeat, so a hammering client cannot cause a write per call.
-  if (!applied.entry || !applied.changed) {
-    return { verdict, priorTierBHits, changed: false, status: applied.status, entry: applied.entry };
+  // A rotation is news even when the status is not: the key was already marked,
+  // and it is the selection that has just moved off it.
+  if (!applied.entry || (!applied.changed && !applied.rotatedTo)) {
+    return { verdict, priorTierBHits, changed: false, status: applied.status, entry: applied.entry, rotated: null };
   }
+
+  const moved = applied.rotatedTo
+    ? (applied.config.providers[provider].keys.find(key => key.id === applied.rotatedTo) || null)
+    : null;
+  const rotated = moved ? { fromKeyId: keyId, toKeyId: moved.id, toLabel: moved.label || '' } : null;
 
   // Tagged first, so the history says *why* the status moved; saveConfig's own
   // vault sync then sees the state already recorded and adds no second line.
-  appendKeyVault(provider, [applied.entry], applied.status);
+  // Only on a real status change: a rotation is not a new fact about the key, and
+  // saveConfig's sync will find nothing to record either.
+  if (applied.changed) appendKeyVault(provider, [applied.entry], applied.status);
   try {
     saveConfig(foldUsage(applied.config));
   } catch (error) {
     Logger.error(`key marked ${applied.status} but the config could not be saved — ${error.message}`);
-    return { verdict, priorTierBHits, changed: false, status: applied.status, entry: applied.entry };
+    // Nothing was persisted, so the selection has not moved either: reporting a
+    // rotation here would have the proxy replay onto a key it never switched to.
+    return { verdict, priorTierBHits, changed: false, status: applied.status, entry: applied.entry, rotated: null };
   }
 
   alerts.set(at(provider, keyId), {
@@ -134,17 +158,25 @@ export function noteUpstreamFailure({ provider, keyId, statusCode, body }) {
     needed: verdict.needed,
     matched: verdict.matched,
     statusCode: verdict.status,
+    // Names the account now serving, so the banner reads as news rather than as
+    // a request. Its presence is also what stops keyAlerts() pruning it.
+    switchedTo: rotated ? (rotated.toLabel || maskKey(moved.key)) : null,
     at: new Date().toISOString()
   });
 
   const balance = verdict.remaining === null ? '' : ` ($${verdict.remaining} left`
     + `${verdict.needed === null ? '' : `, $${verdict.needed} needed`})`;
+  const named = applied.entry.label || applied.entry.id.slice(0, 8);
   Logger.warn(
-    `[${provider}] key ${applied.entry.label || applied.entry.id.slice(0, 8)} is ${applied.status}${balance}`
-    + ` — switch with: ai-proxy keys next ${provider}`
+    `[${provider}] key ${named} is ${applied.status}${balance}`
+    + (rotated
+      ? ` — switched to ${rotated.toLabel || rotated.toKeyId.slice(0, 8)}`
+      : ` — switch with: ai-proxy keys next ${provider}`)
   );
 
-  return { verdict, priorTierBHits, changed: true, status: applied.status, entry: applied.entry };
+  return {
+    verdict, priorTierBHits, changed: applied.changed, status: applied.status, entry: applied.entry, rotated
+  };
 }
 
 /**
@@ -167,9 +199,11 @@ export function keyAlerts() {
     for (const [id, alert] of alerts) {
       const provider = config.providers[alert.provider];
       const entry = (provider?.keys || []).find(key => key.id === alert.keyId);
+      // An alert about a switch already made is not a request, so the selection
+      // says nothing about whether it has been read: only dismissal clears it.
       const answered = !entry
         || entry.status !== alert.status
-        || (alert.status === 'exhausted' && provider.selectedKeyId !== alert.keyId);
+        || (alert.status === 'exhausted' && !alert.switchedTo && provider.selectedKeyId !== alert.keyId);
       if (answered) alerts.delete(id);
     }
   }

@@ -14,7 +14,7 @@ import {
   syncVsCode, applyShellSetup, removeShellSetup, getIntegrationStatus
 } from './controllers/integrationController.js';
 import {
-  importKeys, listKeys, checkKeysCommand, nextKey, useKey, retireKey, reviveKey
+  importKeys, listKeys, checkKeysCommand, nextKey, useKey, retireKey, reviveKey, setRotation
 } from './controllers/keysController.js';
 import { startProxyServer } from './core/proxyServer.js';
 import { loadConfig, CONFIG_FILE } from './core/configManager.js';
@@ -70,6 +70,7 @@ ${Logger.value('Keys')}
   keys use <name> <n|id|label>         Switch to a specific key
   keys retire <name> [n|id|label]      Mark a key spent and switch to the next
   keys revive <name> <n|id|label>      Put a key back in the pool as untested
+  keys rotation <name> [auto|manual]   Who switches when a key runs out (default manual)
 
 ${Logger.value('Models')}
   set-model <name> <model|"">          Pin a model ("" restores pass-through)
@@ -102,6 +103,7 @@ ${Logger.value('Examples')}
   ai-proxy test gorouter
   ai-proxy keys import ~/accounts.xlsx --dry-run
   ai-proxy keys check --balance --concurrency 4
+  ai-proxy keys rotation gorouter auto
 
 Config file: ${CONFIG_FILE}
 `);
@@ -240,10 +242,15 @@ async function runKeys(args, flags) {
     case 'revive':
       reviveKey(rest[0], rest[1]);
       break;
+    case 'rotation':
+      setRotation(rest[0], rest[1]);
+      break;
     default:
       throw new UsageError(
-        action ? `Unknown keys command: '${action}'` : 'Usage: ai-proxy keys <import|list|check|next|use|retire|revive>',
-        'Available: import, list, check, next, use, retire, revive'
+        action
+          ? `Unknown keys command: '${action}'`
+          : 'Usage: ai-proxy keys <import|list|check|next|use|retire|revive|rotation>',
+        'Available: import, list, check, next, use, retire, revive, rotation'
       );
   }
 }

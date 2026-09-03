@@ -10,7 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig } from '../core/configManager.js';
-import { selectKey, nextKeyId, applyKeyVerdict, maskKey } from '../core/keyStore.js';
+import { selectKey, nextKeyId, applyKeyVerdict, maskKey, KEY_ROTATION_MODES } from '../core/keyStore.js';
 import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, RE_KEY } from '../core/keyImport.js';
 import { checkKeys, DEFAULT_LOW } from '../core/keyCheck.js';
 import { Logger } from '../utils/logger.js';
@@ -216,7 +216,10 @@ export function listKeys(providerName) {
         requestsServed: entry.requestsServed,
         lastUsedAt: entry.lastUsedAt,
         lastError: entry.lastError,
-        inUse: entry.id === inUse
+        inUse: entry.id === inUse,
+        // Provider-level, repeated per row like `provider` itself: a caller
+        // reading one key's row can still tell whether anything moves by hand.
+        keyRotation: provider.keyRotation
       });
     });
   }
@@ -306,6 +309,54 @@ export function retireKey(providerName, selector) {
   return { provider: name, from: target, to };
 }
 
+/**
+ * Reads or sets who does the switching for one provider.
+ *
+ * Per provider, and manual by default, because the wording of a refusal differs
+ * between relays: `auto` is only safe once `keys check` has shown that this one
+ * really does say "out of credit" when it means it. Called with no mode it only
+ * reports, so it is also the answer to "what is this provider on?".
+ *
+ * @param {string} providerName
+ * @param {string} [mode] - 'manual' | 'auto'; omit to read
+ * @returns {{provider: string, mode: string, previous: string, changed: boolean}}
+ */
+export function setRotation(providerName, mode) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const previous = provider.keyRotation;
+
+  const wanted = String(mode ?? '').trim().toLowerCase();
+  if (!wanted) {
+    Logger.info(`${name} switches keys ${previous === 'auto' ? 'automatically' : 'when you say so'}.`);
+    if (previous !== 'auto') Logger.dim(`  Hand it the pool: ai-proxy keys rotation ${name} auto`);
+    return { provider: name, mode: previous, previous, changed: false };
+  }
+  if (!KEY_ROTATION_MODES.includes(wanted)) {
+    throw new UsageError(
+      `'${mode}' is not a rotation mode.`,
+      `Use one of: ${KEY_ROTATION_MODES.join(', ')}`
+    );
+  }
+
+  // Saving an unchanged config would rotate the five backups away for nothing,
+  // and every one of them is a copy of the key pool.
+  if (wanted === previous) {
+    Logger.info(`${name} is already on ${previous}.`);
+    return { provider: name, mode: previous, previous, changed: false };
+  }
+
+  saveConfig({ ...config, providers: { ...config.providers, [name]: { ...provider, keyRotation: wanted } } });
+
+  if (wanted === 'auto') {
+    Logger.success(`${name} will now switch to its next account by itself when one runs out.`);
+    Logger.dim('  Only on a refusal that quotes a balance — a rate limit or a WAF page still changes nothing.');
+  } else {
+    Logger.success(`${name} will alert you and keep sending the same key until you switch.`);
+  }
+  return { provider: name, mode: wanted, previous, changed: true };
+}
+
 /** Puts a key back in service as untested. */
 export function reviveKey(providerName, selector) {
   const config = loadConfig();
@@ -338,7 +389,8 @@ function reportKeys(rows, names, config) {
     const dead = mine.filter(row => row.status === 'invalid').length;
 
     Logger.header(`${name} — ${mine.length} key(s)`
-      + (spent ? `, ${spent} spent` : '') + (dead ? `, ${dead} revoked` : ''));
+      + (spent ? `, ${spent} spent` : '') + (dead ? `, ${dead} revoked` : '')
+      + (config.providers[name].keyRotation === 'auto' ? ', switches automatically' : ''));
 
     for (const row of mine) {
       const mark = row.inUse ? '→' : ' ';

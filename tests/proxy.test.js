@@ -598,14 +598,20 @@ test('buildAttemptPlan honours the attempt cap and skips unknown providers', asy
     }
   });
 
-  assert.deepEqual(buildAttemptPlan(config(), 'a'), ['a', 'b', 'c']);
-  assert.deepEqual(buildAttemptPlan(config({ retryMaxAttempts: 2 }), 'a'), ['a', 'b']);
-  assert.deepEqual(buildAttemptPlan(config({ retryEnabled: false }), 'a'), ['a'], 'off means one attempt');
+  // A step is a {provider, keyId} pair: the plan chooses providers, and auto
+  // rotation fills in a key when it moves a provider on to the next account.
+  const names = (...args) => buildAttemptPlan(...args).map(step => step.provider);
+
+  assert.deepEqual(buildAttemptPlan(config(), 'a'), [
+    { provider: 'a', keyId: null }, { provider: 'b', keyId: null }, { provider: 'c', keyId: null }
+  ]);
+  assert.deepEqual(names(config({ retryMaxAttempts: 2 }), 'a'), ['a', 'b']);
+  assert.deepEqual(names(config({ retryEnabled: false }), 'a'), ['a'], 'off means one attempt');
   assert.deepEqual(
-    buildAttemptPlan(config({ failoverProviders: [] }), 'a'), ['a', 'a'],
+    names(config({ failoverProviders: [] }), 'a'), ['a', 'a'],
     'with no failover target the same provider is retried once'
   );
-  assert.deepEqual(buildAttemptPlan(config({ failoverProviders: ['a'] }), 'a'), ['a', 'a'], 'self is not a failover');
+  assert.deepEqual(names(config({ failoverProviders: ['a'] }), 'a'), ['a', 'a'], 'self is not a failover');
 });
 
 test('a streamed body is never retried, because it cannot be replayed', async () => {

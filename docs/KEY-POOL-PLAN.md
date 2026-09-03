@@ -1,19 +1,19 @@
 # Key pool + rotation — implementation plan
 
-Status: **phases 0–5 done** (branch `feat/key-pool`). Pool schema, vault and backups; the
+Status: **phases 0–6 done** (branch `feat/key-pool`). Pool schema, vault and backups; the
 .xlsx reader and importer; the classifier; live detection — the proxy reads the rejection
-body, marks the key, raises an alert and keeps serving until the user switches — and now
+body, marks the key, raises an alert and keeps serving until the user switches;
 `ai-proxy keys check --balance`, which puts a verdict and a balance on every key without
-spending anything. Next: phase 6, per-provider auto rotation.
+spending anything; and now `ai-proxy keys rotation <name> auto`, which lets one provider
+switch account inside the request that found the account empty. Next: phase 7, export + docs.
 
-Two items listed under phase 4 below were deliberately left for later, because both are
-automatic rotation and the locked decision is manual-by-default:
+One item listed under phase 4 below is still deliberately left out:
 
-- **Key-walking in `buildAttemptPlan`** (`{provider, keyId}` pairs). Trying the next key
-  inside a retry *is* rotation, so it belongs to phase 6's per-provider `auto` switch.
 - **Rewriting the 403 body** to say which key is spent. The client currently receives the
   upstream response byte for byte, which is the safer default for SDKs that parse it; the
   same sentence already reaches the user through the daemon log, the CLI and the banner.
+  (In `auto` mode the question mostly disappears: the client gets the answer from the next
+  account instead of the refusal.)
 
 ## Locked decisions
 
@@ -241,6 +241,32 @@ Auto requires: a Tier A match, or a Tier B match that has been seen at least twi
 provider. On trigger: mark exhausted → next key → replay the request (the existing
 `replayable` guard at `proxyServer.js:491` already prevents replaying a streamed body).
 Enable per provider only after Phase 5 has confirmed its real message.
+
+**Shipped as:** `keyRotation` on the provider (normalized in `configManager.js`, anything
+unrecognised reads as `manual`), the `rotate` option on `applyKeyVerdict`, the decision in
+`keyMonitor.js` (`isConfidentExhaustion` + exhaustion only), a `{provider, keyId}` attempt
+*queue* in `proxyServer.js` where the plan used to be a fixed list of names, and
+`ai-proxy keys rotation <name> [auto|manual]` / `POST /api/keys/:name/rotation` / the `auto`
+toggle on the provider card. 253 tests green. Five properties are worth keeping in mind:
+
+- **A pre-authorisation refusal is the one free failure.** Nothing was billed, because
+  nothing ran — that is what makes replaying the same request on the next account safe,
+  where replaying a 502 would risk paying twice.
+- **Auto never rotates on `invalid-key`.** A relay having a bad 401 day would otherwise
+  march through the pool marking every account revoked, one per request. The selection
+  still steps off a revoked key, but that is `selectKey` skipping it, not a replay.
+- **Rotation is not gated on a status *change*.** The first Tier-B sighting marks the key;
+  the second sighting — same key, already `exhausted`, nothing changed — is the one allowed
+  to move the pool on. Gating on `changed` deadlocks Tier B for good.
+- **Walking is bounded** (`MAX_KEY_WALK = 3`) and skipped entirely for a body the proxy
+  could not buffer. A relay wording an outage as "insufficient quota" can cost three
+  accounts a wrong mark, not 261.
+- **A switch is news, not a request:** the alert carries `switchedTo`, which is also what
+  exempts it from `keyAlerts()`'s selection-based pruning — otherwise the banner would
+  vanish in the same instant the rotation made it true, and nobody would learn that an
+  account had run dry. Only dismissal clears it. A rotation onto the key already selected
+  is not a move and is not reported, so two requests in flight on one spent key do not
+  each write the config and churn the five backups.
 
 ### Phase 7 — export + docs
 CSV export (`keys export`), `docs/KEYS.md`, README section, CHANGELOG entry.

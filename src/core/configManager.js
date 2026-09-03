@@ -15,7 +15,7 @@
 
 import fs from 'fs';
 import { CONFIG_DIR, CONFIG_FILE } from './paths.js';
-import { normalizeKeyPool, selectKeyValue, syncKeyVault } from './keyStore.js';
+import { normalizeKeyPool, selectKeyValue, syncKeyVault, KEY_ROTATION_MODES } from './keyStore.js';
 
 /** How many previous versions of config.json to keep beside it. */
 const CONFIG_BACKUPS = 5;
@@ -171,11 +171,16 @@ export function normalizeConfig(raw) {
     const selectedKeyId = String(data.selectedKeyId ?? '').trim();
     const selected = keys.some(k => k.id === selectedKeyId) ? selectedKeyId : '';
 
+    // Anything but the two known modes is read as `manual`: a mode nobody
+    // recognises must not be the one that spends keys on its own.
+    const keyRotation = KEY_ROTATION_MODES.includes(data.keyRotation) ? data.keyRotation : 'manual';
+
     out.providers[name] = {
       url: String(data.url ?? '').trim(),
       apiKey: selectKeyValue(keys, selected),
       keys,
       selectedKeyId: selected,
+      keyRotation,
       defaultModel,
       models,
       ...(data.note ? { note: String(data.note) } : {})

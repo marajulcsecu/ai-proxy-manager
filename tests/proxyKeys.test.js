@@ -60,6 +60,11 @@ before(async () => {
         res.writeHead(status, { 'content-type': type, 'content-length': Buffer.byteLength(body) });
         res.end(body);
       };
+      // Answers per key rather than per route: the first account is out of
+      // credit and the second one works, which is the whole point of auto mode.
+      if (req.url.includes('bykey')) {
+        return seen[seen.length - 1].includes(KEY_A) ? send(403, SPENT_BODY) : send(200, JSON.stringify({ ok: true }));
+      }
       if (req.url.includes('spent')) return send(403, SPENT_BODY);
       if (req.url.includes('huge')) return send(403, HUGE_BODY);
       if (req.url.includes('waf')) return send(403, WAF_BODY, 'text/html');
@@ -89,7 +94,7 @@ after(async () => {
 });
 
 /** A fresh two-key pool with the first key in use. */
-function seedPool() {
+function seedPool({ keys, keyRotation } = {}) {
   clearConfigCache();
   resetKeyMonitor();
   resetLogger();
@@ -98,7 +103,8 @@ function seedPool() {
     providers: {
       gorouter: {
         url: `http://127.0.0.1:${upstream.address().port}/v1`,
-        keys: [
+        ...(keyRotation ? { keyRotation } : {}),
+        keys: keys || [
           { key: KEY_A, status: 'active', label: 'a@example.com' },
           { key: KEY_B, status: 'unknown', label: 'b@example.com' }
         ]
@@ -216,4 +222,98 @@ test('a caller who supplies their own key is not charged against the pool', asyn
   assert.equal(pool().keys[0].status, 'active', 'the key that failed was not one of ours');
   assert.equal(getLogs()[0].keyId, null);
   assert.deepEqual(keyAlerts(), []);
+});
+
+// --- auto mode: the switch happens inside the request ------------------------
+//
+// The pre-authorisation refusal is the one upstream failure that is free: the
+// relay declined *before* running anything, so nothing was billed and the
+// request can be sent again on another account. That is what makes an in-request
+// replay safe here when a 502 retry would not be.
+
+test('an auto provider switches account and answers on the next one', async () => {
+  seedPool({ keyRotation: 'auto' });
+  const response = await call('/v1/messages?bykey=1');
+
+  assert.equal(response.status, 200, 'the client never sees a refusal that was dealt with');
+  assert.deepEqual(await response.json(), { ok: true });
+  assert.deepEqual(seen, [KEY_A, KEY_B], 'the spent account first, then the next one');
+  assert.equal(pool().keys[0].status, 'exhausted');
+  assert.equal(pool().apiKey, KEY_B, 'and the pool stays moved on for the requests after this one');
+});
+
+test('the switch is logged as a second attempt, not hidden inside the first', async () => {
+  seedPool({ keyRotation: 'auto' });
+  await call('/v1/messages?bykey=1');
+
+  const rows = getLogs().filter(row => row.path.includes('bykey'));
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].statusCode, 403);
+  assert.equal(rows[0].keyLabel, 'a@example.com');
+  assert.equal(rows[0].keyVerdict, 'exhausted');
+  assert.equal(rows[1].statusCode, 200);
+  assert.equal(rows[1].keyLabel, 'b@example.com');
+  assert.match(rows[1].retryReason, /credit|exhausted|a@example\.com/i);
+});
+
+test('manual mode hands the same refusal straight to the client', async () => {
+  seedPool();
+  const response = await call('/v1/messages?bykey=1');
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(seen, [KEY_A], 'one account tried, because switching is the user’s call');
+  assert.equal(pool().apiKey, KEY_A);
+});
+
+test('with no account left to try, the refusal is delivered byte for byte', async () => {
+  seedPool({ keyRotation: 'auto', keys: [{ key: KEY_A, status: 'active', label: 'only@example.com' }] });
+  const response = await call('/v1/messages?bykey=1');
+
+  assert.equal(response.status, 403);
+  assert.equal(await response.text(), SPENT_BODY, 'nothing was hidden: there was nothing else to try');
+  assert.deepEqual(seen, [KEY_A]);
+});
+
+test('a WAF page is not a reason to walk the pool', async () => {
+  seedPool({ keyRotation: 'auto' });
+  const response = await call('/v1/messages?waf=1');
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(seen, [KEY_A], 'the key was not the problem, so the next one would fail the same way');
+  assert.equal(pool().keys[0].status, 'active');
+});
+
+test('walking stops well short of the whole pool', async () => {
+  // Every account spent — a relay-wide outage worded as a credit refusal would
+  // look exactly like this. One request must not be able to spend the inventory
+  // looking for a good key; the rest of the pool waits for `keys check`.
+  seedPool({
+    keyRotation: 'auto',
+    keys: 'abcdef'.split('').map(suffix => ({
+      key: `sk-fake00000000000000000000000000000000000000${suffix}0`,
+      status: 'active',
+      label: `${suffix}@example.com`
+    }))
+  });
+  const response = await call('/v1/messages?spent=1');
+
+  assert.equal(response.status, 403);
+  assert.ok(seen.length >= 2, 'it did try another account');
+  assert.ok(seen.length <= 4, `tried ${seen.length} accounts on one request`);
+  assert.equal(new Set(seen).size, seen.length, 'and never the same account twice');
+});
+
+test('a body the proxy could not buffer is marked but never replayed', async () => {
+  // Only model-bearing paths are read into memory; anything else is streamed
+  // straight through and is gone once the first attempt has consumed it.
+  seedPool({ keyRotation: 'auto' });
+  const response = await fetch(`${proxyUrl}/v1/files?bykey=1`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ purpose: 'batch' })
+  });
+
+  assert.equal(response.status, 403);
+  assert.deepEqual(seen, [KEY_A]);
+  assert.equal(pool().keys[0].status, 'exhausted', 'the verdict still stands: only the replay was impossible');
 });

@@ -137,6 +137,15 @@ export function selectKey(keys, selectedId = '') {
     || keys[0];
 }
 
+/**
+ * What a provider does when a key of its own turns out to be spent.
+ *
+ * `manual` alerts and changes nothing, which is the default because a wrong
+ * verdict then costs an alert rather than a working key. `auto` lets a
+ * *confident* verdict move the pool on by itself — see isConfidentExhaustion().
+ */
+export const KEY_ROTATION_MODES = ['manual', 'auto'];
+
 /** True for a key worth sending: not spent, not revoked, not switched off. */
 const usable = key => key && !['exhausted', 'invalid', 'disabled'].includes(key.status);
 
@@ -171,20 +180,27 @@ export function selectKeyValue(keys, selectedId = '') {
  *
  * Only a verdict about the key itself changes its status; a Cloudflare page or a
  * rate limit is written to `lastError` and nothing else, because the key is not
- * the problem. The selection is never moved here — see selectKey().
+ * the problem. The selection only moves when the caller asks for it — see
+ * selectKey() and the `rotate` option.
  *
  * @param {Object} config - normalized config; not mutated
  * @param {string} providerName
  * @param {string} keyId
  * @param {import('./creditSignals.js').UpstreamVerdict|null} verdict
- * @returns {{config: Object, changed: boolean, entry: Object|null, status: string|null}}
+ * @param {{rotate?: boolean}} [options] - `rotate` hands the selection to the
+ *   next usable key when this verdict says the current one is spent. The
+ *   caller owns that decision: it needs the provider's mode and the
+ *   classifier's confidence, neither of which is this function's business.
+ * @returns {{config: Object, changed: boolean, entry: Object|null,
+ *   status: string|null, rotatedTo: string|null}}
  *          `changed` is true only when the key's status moved, i.e. when there
- *          is something to tell the user about.
+ *          is something to tell the user about. `rotatedTo` is the id of the key
+ *          now in use, and only set when the selection really moved.
  */
-export function applyKeyVerdict(config, providerName, keyId, verdict) {
+export function applyKeyVerdict(config, providerName, keyId, verdict, options = {}) {
   const provider = config?.providers?.[providerName];
   const index = provider ? (provider.keys || []).findIndex(k => k.id === keyId) : -1;
-  if (!verdict || index < 0) return { config, changed: false, entry: null, status: null };
+  if (!verdict || index < 0) return { config, changed: false, entry: null, status: null, rotatedTo: null };
 
   const status = verdict.kind === 'exhausted' ? 'exhausted'
     : verdict.kind === 'invalid-key' ? 'invalid'
@@ -207,7 +223,15 @@ export function applyKeyVerdict(config, providerName, keyId, verdict) {
   // switches: pin the selection to it, or the mirror would quietly slide to the
   // next key — auto-rotation by accident. A revoked key is a fact, not a
   // judgement, so it is never pinned.
-  const pinned = changed && status === 'exhausted' ? keyId : (provider.selectedKeyId || '');
+  //
+  // Auto mode inverts exactly that pin. `changed` is deliberately not the
+  // condition: a key marked spent on an earlier request is still the one being
+  // sent, and this is the moment to leave it behind. A target equal to the
+  // selection already in place is not a move, so it is not reported as one —
+  // otherwise two requests in flight on the same spent key would each write.
+  const target = options.rotate && status === 'exhausted' ? nextKeyId(keys, keyId) : null;
+  const rotatedTo = target && target !== (provider.selectedKeyId || '') ? target : null;
+  const pinned = rotatedTo || (changed && status === 'exhausted' ? keyId : (provider.selectedKeyId || ''));
   const selectedKeyId = keys.some(k => k.id === pinned) ? pinned : '';
 
   const next = {
@@ -218,7 +242,7 @@ export function applyKeyVerdict(config, providerName, keyId, verdict) {
     }
   };
 
-  return { config: next, changed, entry, status };
+  return { config: next, changed, entry, status, rotatedTo };
 }
 
 // --- the vault --------------------------------------------------------------

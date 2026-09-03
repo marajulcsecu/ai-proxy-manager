@@ -17,7 +17,7 @@ import { getLogs, getLogById, getStatus, clearLogs, configureLogger } from './re
 import { parseProviderUrl } from './upstream.js';
 import { maskKey, selectKey } from './keyStore.js';
 import { keyAlerts, dismissKeyAlert } from './keyMonitor.js';
-import { nextKey, useKey, retireKey, reviveKey } from '../controllers/keysController.js';
+import { nextKey, useKey, retireKey, reviveKey, setRotation } from '../controllers/keysController.js';
 import { testProvider } from './providerTester.js';
 import { getDaemonStatus } from './daemon.js';
 import { getRuntime } from './runtime.js';
@@ -102,6 +102,7 @@ function providerView(name, data, config) {
     keysUnusable: (data.keys || []).filter(entry => entry.status === 'invalid' || entry.status === 'disabled').length,
     keyLabel: selectKey(data.keys, data.selectedKeyId)?.label || '',
     keyRemaining: selectKey(data.keys, data.selectedKeyId)?.remaining ?? null,
+    keyRotation: data.keyRotation,
     passThrough: !data.defaultModel,
     isActive: name === config.active_provider
   };
@@ -366,6 +367,9 @@ function keyPoolView(name, data) {
     spent: keys.filter(key => key.status === 'exhausted').length,
     unusable: keys.filter(key => key.status === 'invalid' || key.status === 'disabled').length,
     selectedKeyId: data.selectedKeyId || '',
+    // Whether a spent key waits for the user or is left behind on the spot.
+    // The banner reads differently in each case.
+    rotation: data.keyRotation,
     inUse,
     keys
   };
@@ -413,6 +417,12 @@ route('POST', new RegExp(`^/api/keys/(${NAME})/revive$`), async ({ req, res, par
   const body = await parseBody(req);
   const { entry } = reviveKey(params[0], body.keyId ?? body.selector);
   sendJSON(res, 200, { ok: true, provider: params[0], entry: keyRef(entry) });
+});
+
+route('POST', new RegExp(`^/api/keys/(${NAME})/rotation$`), async ({ req, res, params }) => {
+  const body = await parseBody(req).catch(() => ({}));
+  const { mode, previous, changed } = setRotation(params[0], body.mode ?? body.rotation);
+  sendJSON(res, 200, { ok: true, provider: params[0], mode, previous, changed });
 });
 
 route('DELETE', new RegExp(`^/api/keys/(${NAME})/alerts/([a-f0-9]+)$`), ({ res, params }) => {

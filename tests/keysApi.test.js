@@ -47,13 +47,14 @@ after(async () => {
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-function seed() {
+function seed(extra = {}) {
   clearConfigCache();
   resetKeyMonitor();
   saveConfig({
     providers: {
       gorouter: {
         url: 'https://gorouter.app/v1',
+        ...extra,
         keys: [
           { key: KEY_A, status: 'active', label: 'a@example.com', remaining: 55.34 },
           { key: KEY_B, status: 'unknown', label: 'b@example.com' },
@@ -240,4 +241,57 @@ test('a provider with a single legacy key reports a pool of one', async () => {
   assert.equal(provider.keysSpent, 0);
   assert.equal(provider.keyLabel, '');
   seed();
+});
+
+// --- who does the switching --------------------------------------------------
+
+test('the pool says whether the provider switches by itself', async () => {
+  seed();
+  const response = await call('/api/keys');
+  assert.equal(response.data.providers[0].rotation, 'manual');
+});
+
+test('POST rotation hands a provider its own pool, and takes it back', async () => {
+  seed();
+
+  const on = await call('/api/keys/gorouter/rotation', { method: 'POST', body: { mode: 'auto' } });
+  assert.equal(on.status, 200);
+  assert.deepEqual({ mode: on.data.mode, changed: on.data.changed }, { mode: 'auto', changed: true });
+  assert.equal(pool().keyRotation, 'auto');
+
+  const off = await call('/api/keys/gorouter/rotation', { method: 'POST', body: { mode: 'manual' } });
+  assert.equal(off.data.mode, 'manual');
+  assert.equal(pool().keyRotation, 'manual');
+});
+
+test('a mode the proxy does not know is a 400, not a silent manual', async () => {
+  seed({ keyRotation: 'auto' });
+
+  const response = await call('/api/keys/gorouter/rotation', { method: 'POST', body: { mode: 'sometimes' } });
+
+  assert.equal(response.status, 400);
+  assert.match(response.data.hint, /manual|auto/);
+  assert.equal(pool().keyRotation, 'auto', 'and the provider keeps the mode it had');
+});
+
+test('a switch the proxy made itself reaches the browser as news, not as a request', async () => {
+  seed({ keyRotation: 'auto' });
+  noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: SPENT });
+
+  const response = await call('/api/keys');
+  const [alert] = response.data.alerts;
+
+  assert.equal(alert.keyId, ID_A);
+  assert.equal(alert.switchedTo, 'b@example.com', 'the banner names the account now serving');
+  assert.equal(response.data.providers[0].keys[1].inUse, true);
+  assert.equal(pool().apiKey, KEY_B);
+});
+
+test('the provider card is told the mode, so it can say who will switch', async () => {
+  seed({ keyRotation: 'auto' });
+
+  const { data } = await call('/api/providers');
+  const provider = data.providers.find(entry => entry.name === 'gorouter');
+
+  assert.equal(provider.keyRotation, 'auto');
 });

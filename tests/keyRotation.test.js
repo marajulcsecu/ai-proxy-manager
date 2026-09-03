@@ -146,3 +146,97 @@ test('a verdict for a key or provider that is gone is a no-op, not a crash', () 
   assert.equal(applyKeyVerdict(config(), 'nosuch', id(A), exhaustion).changed, false);
   assert.equal(applyKeyVerdict(config(), 'gorouter', id(A), null).changed, false);
 });
+
+// --- auto mode: the same verdict, this time allowed to move the selection -----
+//
+// Auto is per provider and opt-in. Whether to rotate is the caller's decision —
+// the monitor takes it from the provider's mode and the classifier's confidence
+// — so this layer only has to be honest about what rotating means: the spent key
+// is left behind instead of pinned, and when there is nothing to move to, the
+// pinning behaviour is what remains.
+
+test('keyRotation is manual unless the provider asked for auto', () => {
+  const providers = normalizeConfig({
+    providers: {
+      one: { url: 'https://one.example/v1', keys: [{ key: A }] },
+      two: { url: 'https://two.example/v1', keys: [{ key: B }], keyRotation: 'auto' },
+      three: { url: 'https://three.example/v1', keys: [{ key: C }], keyRotation: 'whenever' }
+    }
+  }).providers;
+
+  assert.equal(providers.one.keyRotation, 'manual');
+  assert.equal(providers.two.keyRotation, 'auto', 'the mode must survive a save, or it is off again on the next write');
+  assert.equal(providers.three.keyRotation, 'manual', 'an unreadable mode falls back to the cautious one');
+});
+
+test('rotating hands the selection to the next key instead of pinning the spent one', () => {
+  const { config: next, rotatedTo } = applyKeyVerdict(config(), 'gorouter', id(A), exhaustion, { rotate: true });
+  const provider = next.providers.gorouter;
+
+  assert.equal(provider.keys[0].status, 'exhausted');
+  assert.equal(rotatedTo, id(B));
+  assert.equal(provider.selectedKeyId, id(B));
+  assert.equal(provider.apiKey, B, 'the mirror is what the next request goes out on');
+});
+
+test('rotating with nothing left to switch to keeps the spent key pinned', () => {
+  // The last account in the pool. Pinning is what manual mode does, and it is
+  // right here too: this is the account the user may top up.
+  const only = normalizeConfig({
+    providers: { gorouter: { url: 'https://gorouter.app/v1', keys: [{ key: A, status: 'active' }] } }
+  });
+  const { config: next, rotatedTo } = applyKeyVerdict(only, 'gorouter', id(A), exhaustion, { rotate: true });
+
+  assert.equal(rotatedTo, null);
+  assert.equal(next.providers.gorouter.selectedKeyId, id(A));
+  assert.equal(next.providers.gorouter.apiKey, A);
+});
+
+test('a key already marked spent is still handed over, because it is still the one in use', () => {
+  // How the first sighting of an unconfirmed phrase resolves: it pinned the key,
+  // and the second sighting is the one that gets to move the pool on. Without
+  // this the pin would outlast the reason for it.
+  const pinned = normalizeConfig({
+    providers: {
+      gorouter: {
+        url: 'https://gorouter.app/v1',
+        selectedKeyId: id(A),
+        keys: [{ key: A, status: 'exhausted' }, { key: B, status: 'unknown' }]
+      }
+    }
+  });
+  const { config: next, changed, rotatedTo } = applyKeyVerdict(pinned, 'gorouter', id(A), exhaustion, { rotate: true });
+
+  assert.equal(changed, false, 'the status was already right');
+  assert.equal(rotatedTo, id(B));
+  assert.equal(next.providers.gorouter.apiKey, B);
+});
+
+test('a rotation is only reported when the selection actually moved', () => {
+  // Two requests in flight on the same spent key: the first moves the pool, and
+  // the second must not report a move it did not make, or the proxy would write
+  // the config once per request for as long as the client keeps trying.
+  const moved = normalizeConfig({
+    providers: {
+      gorouter: {
+        url: 'https://gorouter.app/v1',
+        selectedKeyId: id(B),
+        keys: [{ key: A, status: 'exhausted' }, { key: B, status: 'active' }]
+      }
+    }
+  });
+  const { changed, rotatedTo } = applyKeyVerdict(moved, 'gorouter', id(A), exhaustion, { rotate: true });
+
+  assert.equal(rotatedTo, null);
+  assert.equal(changed, false, 'nothing to write and nothing to say');
+});
+
+test('a rotation asked for on a verdict about something else moves nothing', () => {
+  // Auto mode with a Cloudflare page in front of the relay: not the key's fault,
+  // so not the key's turn to be replaced.
+  const { config: next, rotatedTo } = applyKeyVerdict(config(), 'gorouter', id(A),
+    { kind: 'transient', status: 403, matched: '/cloudflare/i' }, { rotate: true });
+
+  assert.equal(rotatedTo, null);
+  assert.equal(next.providers.gorouter.apiKey, A);
+});

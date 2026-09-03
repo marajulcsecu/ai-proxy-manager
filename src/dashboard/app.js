@@ -402,6 +402,11 @@ function formatCredit(value) {
  * The banner the proxy raises when a key stops working. It sits above every
  * view because in manual mode nothing moves until it is answered: the proxy
  * keeps sending the spent key on purpose, so the user decides when to switch.
+ *
+ * An alert carrying `switchedTo` is the other case — auto rotation has already
+ * moved on — so it is written as news and offers nothing to click but dismiss.
+ * Rendering a "Switch →" button there would switch a second time, past an
+ * account that is still good.
  */
 function renderKeyAlerts() {
   const host = $('#key-alerts');
@@ -418,15 +423,19 @@ function renderKeyAlerts() {
       ? 'was rejected as invalid'
       : `is out of credit${left ? ` (${left} left${need ? `, ${need} needed` : ''})` : ''}`;
 
+    const note = alert.switchedTo
+      ? `Switched to <strong>${esc(alert.switchedTo)}</strong> automatically.`
+      : 'Requests still go to this key until you switch.';
+
     return `
-      <div class="key-alert is-${alert.status === 'invalid' ? 'danger' : 'warn'}">
-        <span class="key-alert-icon" aria-hidden="true">${alert.status === 'invalid' ? '✖' : '▲'}</span>
+      <div class="key-alert is-${alert.switchedTo ? 'info' : (alert.status === 'invalid' ? 'danger' : 'warn')}">
+        <span class="key-alert-icon" aria-hidden="true">${alert.switchedTo ? '⇄' : (alert.status === 'invalid' ? '✖' : '▲')}</span>
         <span class="key-alert-text">
           <strong>${esc(alert.provider)}</strong> key <strong>${esc(who)}</strong> ${esc(reason)}.
-          <span class="muted">Requests still go to this key until you switch.</span>
+          <span class="muted">${note}</span>
         </span>
-        <button class="btn btn-sm btn-primary" data-action="key-next"
-                data-name="${attr(alert.provider)}">Switch →</button>
+        ${alert.switchedTo ? '' : `<button class="btn btn-sm btn-primary" data-action="key-next"
+                data-name="${attr(alert.provider)}">Switch →</button>`}
         <button class="btn btn-sm btn-icon" data-action="key-dismiss"
                 data-name="${attr(alert.provider)}" data-key-id="${attr(alert.keyId)}"
                 aria-label="Dismiss this alert" title="Dismiss">✕</button>
@@ -467,6 +476,26 @@ async function retireKey(name) {
   toast(`${name}: ${data.from?.label || 'that key'} retired, now using ${data.to?.label || data.to?.masked || 'the next key'}`, 'ok');
   state.rendered.keyAlerts = null;
   refreshStatus();
+  refreshProviders();
+}
+
+/**
+ * Hands a provider its own pool, or takes it back. Per provider, because auto
+ * is only safe once `ai-proxy keys check` has shown what this relay says when an
+ * account runs dry — a different refusal wording would spend keys for nothing.
+ */
+async function setKeyRotation(name, mode) {
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/rotation`, {
+    method: 'POST',
+    body: { mode }
+  });
+  if (!data?.ok) {
+    toast([data?.error, data?.hint].filter(Boolean).join(' — ') || 'Could not change the mode', 'error');
+    return;
+  }
+  toast(data.mode === 'auto'
+    ? `${name} will switch account by itself when one runs out`
+    : `${name} will ask before switching account`, 'ok');
   refreshProviders();
 }
 
@@ -645,6 +674,14 @@ function providerCardHtml(provider) {
                    data-focus-key="key-next:${attr(name)}" title="Switch to the next usable key">next key</button>
            <button class="key-reveal" data-action="key-retire" data-name="${attr(name)}"
                    data-focus-key="key-retire:${attr(name)}" title="Mark this key spent and switch">retire</button>
+           <button class="key-reveal" data-action="key-rotation" data-name="${attr(name)}"
+                   data-mode="${attr(provider.keyRotation === 'auto' ? 'manual' : 'auto')}"
+                   data-focus-key="key-rotation:${attr(name)}"
+                   title="${attr(provider.keyRotation === 'auto'
+                     ? 'Stop switching by itself: alert instead and keep sending the same key'
+                     : 'Switch to the next account by itself when this one runs out of credit')}">
+             ${provider.keyRotation === 'auto' ? 'auto ✓' : 'auto'}
+           </button>
          </span>
        </div>`
     : '';
@@ -1464,6 +1501,7 @@ const ACTIONS = {
   'key-next': target => switchKey(target.dataset.name),
   'key-retire': target => retireKey(target.dataset.name),
   'key-dismiss': target => dismissKeyAlert(target.dataset.name, target.dataset.keyId),
+  'key-rotation': target => setKeyRotation(target.dataset.name, target.dataset.mode),
   'form-remove-model': target => {
     formModels = formModels.filter(model => model !== target.dataset.model);
     renderFormModels();
