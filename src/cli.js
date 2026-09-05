@@ -14,7 +14,8 @@ import {
   syncVsCode, applyShellSetup, removeShellSetup, getIntegrationStatus
 } from './controllers/integrationController.js';
 import {
-  importKeys, listKeys, checkKeysCommand, nextKey, useKey, retireKey, reviveKey, setRotation, exportKeys
+  importKeys, listKeys, checkKeysCommand, nextKey, useKey, retireKey, reviveKey, setRotation, exportKeys,
+  addKey, editKey, removeKey, revealKey
 } from './controllers/keysController.js';
 import { startProxyServer } from './core/proxyServer.js';
 import { loadConfig, CONFIG_FILE } from './core/configManager.js';
@@ -39,7 +40,7 @@ function parseArgs(argv) {
     }
     const name = arg.replace(/^-+/, '');
     const next = argv[i + 1];
-    if (next !== undefined && !next.startsWith('-') && /^(port|n|lines|model|concurrency|low|timeout)$/.test(name)) {
+    if (next !== undefined && !next.startsWith('-') && /^(port|n|lines|model|concurrency|low|timeout|label|account|note|dashboard|referral|credit)$/.test(name)) {
       flags[name] = next;
       i++;
     } else {
@@ -64,7 +65,12 @@ ${Logger.value('Providers')}
 
 ${Logger.value('Keys')}
   keys import <file…> [--dry-run]      Import accounts from .xlsx/.csv spreadsheets
+      [--create-providers]             …and build providers the sheet names but the config lacks
   keys list [name]                     Show each pool: status, balance, key in use
+  keys add <name> <key> [--label …]    Add one key by hand (--use to send it now)
+  keys edit <name> <n|id|label> …      Correct the account, note or links
+  keys remove <name> <n|id|label> --yes  Delete a key (the vault still keeps it)
+  keys reveal <name> <n|id|label>      Print one key in full
   keys check [name] [--balance]        Probe every key: accepted, spent or revoked
   keys next <name>                     Switch to the next usable key
   keys use <name> <n|id|label>         Switch to a specific key
@@ -103,6 +109,7 @@ ${Logger.value('Examples')}
   ai-proxy use gorouter && ai-proxy start --daemon
   ai-proxy test gorouter
   ai-proxy keys import ~/accounts.xlsx --dry-run
+  ai-proxy keys add gorouter sk-… --label me@gmail.com --credit 5
   ai-proxy keys check --balance --concurrency 4
   ai-proxy keys rotation gorouter auto
   ai-proxy keys export ~/keys-backup.csv --with-keys
@@ -211,6 +218,19 @@ async function runLogs(flags) {
 }
 
 /**
+ * One `--flag`'s text value.
+ *
+ * Absent means "leave that field alone", so it has to stay `undefined`; a bare
+ * `--note` with nothing after it means "clear it", which is an empty string.
+ * @param {string|boolean|undefined} value
+ * @returns {string|undefined}
+ */
+function textFlag(value) {
+  if (value === undefined) return undefined;
+  return value === true ? '' : String(value);
+}
+
+/**
  * `keys` sub-commands. Listed explicitly so an unknown verb says what is
  * actually available rather than printing the whole CLI help.
  */
@@ -218,7 +238,10 @@ async function runKeys(args, flags) {
   const [action, ...rest] = args;
   switch (action) {
     case 'import':
-      importKeys(rest, { dryRun: Boolean(flags['dry-run'] || flags.dry) });
+      importKeys(rest, {
+        dryRun: Boolean(flags['dry-run'] || flags.dry),
+        createProviders: Boolean(flags['create-providers'] || flags.create)
+      });
       break;
     case 'list':
     case 'ls':
@@ -232,6 +255,49 @@ async function runKeys(args, flags) {
         timeoutMs: Number(flags.timeout) ? Number(flags.timeout) * 1000 : undefined
       });
       break;
+    case 'add':
+    case 'new':
+      addKey(rest[0], rest[1], {
+        label: textFlag(flags.label ?? flags.account),
+        note: textFlag(flags.note),
+        dashboardUrl: textFlag(flags.dashboard),
+        referralUrl: textFlag(flags.referral),
+        remaining: flags.credit === undefined || flags.credit === true ? undefined : Number(flags.credit),
+        use: Boolean(flags.use)
+      });
+      break;
+    case 'edit':
+    case 'set': {
+      const fields = {};
+      for (const [field, flag] of [['label', flags.label ?? flags.account], ['note', flags.note],
+        ['dashboardUrl', flags.dashboard], ['referralUrl', flags.referral]]) {
+        const value = textFlag(flag);
+        if (value !== undefined) fields[field] = value;
+      }
+      if (!Object.keys(fields).length) {
+        throw new UsageError(
+          'Nothing to change.',
+          `ai-proxy keys edit ${rest[0] || '<provider>'} ${rest[1] || '<n|id|account>'}`
+            + ' --label <account> [--note <text>] [--dashboard <url>] [--referral <url>]'
+        );
+      }
+      editKey(rest[0], rest[1], fields);
+      break;
+    }
+    case 'remove':
+    case 'rm':
+    case 'delete':
+      removeKey(rest[0], rest[1], { confirmed: Boolean(flags.yes || flags.y || flags.force) });
+      break;
+    case 'reveal':
+    case 'show': {
+      // The value goes to stdout on its own line, so AI_PROXY_QUIET=1 leaves
+      // exactly the key and nothing else for a script to read.
+      const shown = revealKey(rest[0], rest[1]);
+      Logger.dim(`${shown.provider} #${shown.position} · ${shown.entry.label || 'no account recorded'} · ${shown.entry.status}`);
+      console.log(shown.key);
+      break;
+    }
     case 'next':
       nextKey(rest[0]);
       break;
@@ -254,8 +320,8 @@ async function runKeys(args, flags) {
       throw new UsageError(
         action
           ? `Unknown keys command: '${action}'`
-          : 'Usage: ai-proxy keys <import|list|check|next|use|retire|revive|rotation|export>',
-        'Available: import, list, check, next, use, retire, revive, rotation, export'
+          : 'Usage: ai-proxy keys <import|list|add|edit|remove|reveal|check|next|use|retire|revive|rotation|export>',
+        'Available: import, list, add, edit, remove, reveal, check, next, use, retire, revive, rotation, export'
       );
   }
 }

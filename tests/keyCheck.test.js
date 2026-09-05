@@ -260,6 +260,27 @@ test('liveness alone never overrules a spent key: only a balance can', async () 
   assert.equal(entry(RICH).remaining, 0.2, 'and nothing about the balance either');
 });
 
+test('a relay that accepts the probe without quoting a figure keeps the balance it was given', async () => {
+  // The imported figure is the only one anyone has: a relay rich enough to let
+  // the probe through says the key *has* credit, not how much. Overwriting it
+  // with nothing would throw away what the spreadsheet knew.
+  seed([{ key: RICH, status: 'unknown', label: 'rich@example.com', remaining: 79.39 }]);
+  const report = await checkKeys({ balance: true });
+
+  assert.equal(entry(RICH).status, 'active', 'it answered, so it is live');
+  assert.equal(entry(RICH).remaining, 79.39, 'nothing was measured, so nothing replaces the known figure');
+  assert.equal(report.results[0].remaining, 79.39, 'and the report quotes it rather than a blank');
+});
+
+test('an unquotable balance on an unchanged key writes nothing at all', async () => {
+  seed([{ key: RICH, status: 'active', label: 'rich@example.com', remaining: 79.39 }]);
+  const before = fs.readFileSync(CONFIG_FILE, 'utf8');
+  await checkKeys({ balance: true });
+
+  assert.equal(fs.readFileSync(CONFIG_FILE, 'utf8'), before, 'no verdict and no number is nothing learned');
+  assert.ok(!fs.existsSync(`${CONFIG_FILE}.bak.1`), 'a pointless save rotates a real backup off the end');
+});
+
 test('an untested key that answers is marked active without a balance probe', async () => {
   seed([{ key: RICH, status: 'unknown', label: 'rich@example.com' }]);
   await checkKeys();

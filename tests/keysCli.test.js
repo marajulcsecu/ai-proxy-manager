@@ -142,3 +142,104 @@ test('a file that is not a spreadsheet is refused before anything is written', (
   assert.throws(() => importKeys([junk]), UsageError);
   assert.equal(fs.readFileSync(CONFIG_FILE, 'utf8'), before);
 });
+
+// --- a relay the config has never heard of ------------------------------------
+//
+// Four real keys sat unimported for one reason: the sheet knows a provider the
+// proxy does not. The sheet also holds its URL, so it can be created — but that
+// puts a new host in the config, so it happens only when asked for.
+
+/** The row-per-provider layout, which is the one that carries a URL. */
+function inventoryFile(name, rows) {
+  return sheetFile(name, [
+    'a@example.com(github linked)', 'API Provider: ', 'API Key:',
+    'URL For API KEY', 'Referel Link: ', 'Remaining Credit', 'Top Models'
+  ], rows);
+}
+
+test('a key for an unconfigured provider stays out unless creating one is asked for', () => {
+  seed();
+  const file = inventoryFile('new-relay.xlsx', [
+    ['Just Do work', 'https://api.justwoker.icu/', KEY_B, '', '', '10', 'claude-opus-5']
+  ]);
+
+  const summary = importKeys([file]);
+
+  assert.equal(summary.added, 0);
+  assert.equal(summary.unresolved.length, 1);
+  assert.deepEqual(summary.created, []);
+  assert.deepEqual(Object.keys(loadConfig({ fresh: true }).providers), ['gorouter', 'tabitoken']);
+});
+
+test('--create-providers builds the provider from the sheet and files the key in it', () => {
+  seed();
+  const file = inventoryFile('created.xlsx', [
+    ['Just Do work', 'https://api.justwoker.icu/', KEY_B, '', '', '10', 'claude-opus-5,\nclaude-opus-4-8']
+  ]);
+
+  const summary = importKeys([file], { createProviders: true });
+
+  assert.deepEqual(summary.created.map(p => [p.name, p.url]), [['justwoker', 'https://api.justwoker.icu/v1']]);
+  assert.equal(summary.added, 1);
+  assert.deepEqual(summary.unresolved, [], 'a created provider leaves nothing unresolved');
+
+  const provider = loadConfig({ fresh: true }).providers.justwoker;
+  assert.equal(provider.url, 'https://api.justwoker.icu/v1');
+  assert.deepEqual(provider.keys.map(k => [k.key, k.status, k.remaining]), [[KEY_B, 'unknown', 10]]);
+  assert.deepEqual(provider.models, ['claude-opus-5', 'claude-opus-4-8']);
+  assert.equal(provider.defaultModel, '', 'which model to send stays the user\'s decision');
+});
+
+test('the models column reaches a provider that already exists', () => {
+  seed();
+  const file = inventoryFile('models.xlsx', [
+    ['GoRouter', 'https://gorouter.app/', KEY_A, '', '', '5', 'claude-opus-5-thinking,\nclaude-opus-5']
+  ]);
+
+  const summary = importKeys([file]);
+
+  assert.equal(summary.modelsAdded, 2);
+  assert.deepEqual(loadConfig({ fresh: true }).providers.gorouter.models, ['claude-opus-5-thinking', 'claude-opus-5']);
+});
+
+test('a dry run that would create a provider still writes nothing', () => {
+  seed();
+  const file = inventoryFile('dry-create.xlsx', [
+    ['Just Do work', 'https://api.justwoker.icu/', KEY_B]
+  ]);
+  const before = fs.readFileSync(CONFIG_FILE, 'utf8');
+
+  const summary = importKeys([file], { createProviders: true, dryRun: true });
+
+  assert.equal(summary.created.length, 1);
+  assert.equal(summary.added, 1, 'the numbers are what the run would do');
+  assert.equal(fs.readFileSync(CONFIG_FILE, 'utf8'), before);
+});
+
+test('a key with no URL to point a provider at is still reported, never invented', () => {
+  seed();
+  const file = sheetFile('headerless.xlsx', ['mail', 'GoRouter', 'Some New Relay'], [
+    ['a@example.com', KEY_A, KEY_B]
+  ]);
+
+  const summary = importKeys([file], { createProviders: true });
+
+  assert.deepEqual(summary.created, []);
+  assert.equal(summary.unresolved.length, 1);
+  assert.equal(summary.unresolved[0].key, KEY_B);
+  assert.deepEqual(Object.keys(loadConfig({ fresh: true }).providers), ['gorouter', 'tabitoken']);
+});
+
+test('a dry run leaves no phantom provider behind in memory', () => {
+  // loadConfig() hands out a cached object that the proxy reads on every
+  // request. Building the new provider into it directly would route traffic to
+  // a host that is not in the file — and after a dry run, never will be.
+  seed();
+  const file = inventoryFile('phantom.xlsx', [
+    ['Just Do work', 'https://api.justwoker.icu/', KEY_B]
+  ]);
+
+  importKeys([file], { createProviders: true, dryRun: true });
+
+  assert.equal(loadConfig().providers.justwoker, undefined);
+});

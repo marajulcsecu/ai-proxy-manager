@@ -386,11 +386,25 @@ export async function checkKeys(options = {}) {
       const measured = result.verdict === 'spent' || result.verdict === 'funded';
       const changed = status !== before.status;
 
-      if (changed || measured) {
+      // Only what the relay actually quoted. A relay rich enough to let the
+      // probe through has said the key *has* credit, not how much — so there is
+      // no figure to write, and the one already on the entry (from the import,
+      // or from the last relay that did quote one) is the only one anyone has.
+      // Same rule as `applyKeyVerdict` on the live path: a balance is written
+      // when a number was given and left alone when one was not.
+      const quoted = {};
+      if (measured && result.remaining !== null && result.remaining !== undefined) {
+        quoted.remaining = result.remaining;
+      }
+      if (measured && result.needed !== null && result.needed !== undefined) {
+        quoted.needed = result.needed;
+      }
+
+      if (changed || quoted.remaining !== undefined || quoted.needed !== undefined) {
         keys[index] = {
           ...before,
           status,
-          ...(measured ? { remaining: result.remaining, needed: result.needed } : {}),
+          ...quoted,
           lastError: status === 'invalid' || status === 'exhausted' ? (result.message || null) : before.lastError
         };
         touched = true;
@@ -407,8 +421,8 @@ export async function checkKeys(options = {}) {
         label: before.label,
         verdict: result.verdict,
         statusCode: result.statusCode,
-        remaining: measured ? result.remaining : before.remaining,
-        needed: measured ? result.needed : before.needed,
+        remaining: quoted.remaining ?? before.remaining ?? null,
+        needed: quoted.needed ?? before.needed ?? null,
         was: before.status,
         status,
         changed,

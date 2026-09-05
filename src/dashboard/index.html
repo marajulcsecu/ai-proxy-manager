@@ -45,6 +45,10 @@
           <span class="nav-icon" aria-hidden="true">▤</span> Providers
           <span class="nav-badge" id="nav-provider-count"></span>
         </button>
+        <button class="nav-item" role="tab" data-view="keys">
+          <span class="nav-icon" aria-hidden="true">⚿</span> Keys
+          <span class="nav-badge" id="nav-key-count"></span>
+        </button>
         <button class="nav-item" role="tab" data-view="requests">
           <span class="nav-icon" aria-hidden="true">≡</span> Requests
           <span class="nav-badge" id="nav-request-count"></span>
@@ -144,6 +148,38 @@
 
         <div class="provider-grid" id="provider-grid" aria-live="polite">
           <div class="skeleton"></div>
+          <div class="skeleton"></div>
+        </div>
+      </section>
+
+      <!-- ------------------------------ KEYS ------------------------------ -->
+      <section class="view" id="view-keys" hidden>
+        <div class="view-head">
+          <h1>Keys</h1>
+          <p class="muted">Every account this proxy can bill, per provider, in the order it will spend them.
+            The highlighted row is the key going out right now.</p>
+        </div>
+
+        <div class="log-toolbar">
+          <select class="input" id="key-filter-provider" aria-label="Filter by provider">
+            <option value="">All providers</option>
+          </select>
+          <select class="input" id="key-filter-status" aria-label="Filter by status">
+            <option value="">Any status</option>
+            <option value="usable">Usable</option>
+            <option value="active">Confirmed active</option>
+            <option value="unknown">Untested</option>
+            <option value="exhausted">Out of credit</option>
+            <option value="dead">Revoked or disabled</option>
+          </select>
+          <input class="input" type="search" id="key-search" placeholder="Search account, note or key…"
+                 autocomplete="off" spellcheck="false" aria-label="Search keys">
+          <div class="topbar-spacer"></div>
+          <span class="dim" id="keys-summary"></span>
+          <button class="btn btn-primary btn-sm" id="add-key-btn">+ Add key</button>
+        </div>
+
+        <div id="keys-area" aria-live="polite">
           <div class="skeleton"></div>
         </div>
       </section>
@@ -293,6 +329,58 @@
         <div class="dialog-foot">
           <button type="button" class="btn" data-close-overlay>Cancel</button>
           <button type="submit" class="btn btn-primary" id="pf-submit">Add provider</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ======================== KEY ADD / EDIT DIALOG ======================== -->
+  <div class="overlay" id="key-overlay" role="dialog" aria-modal="true" aria-labelledby="key-dialog-title">
+    <div class="dialog">
+      <div class="dialog-head">
+        <h2 id="key-dialog-title">Add key</h2>
+        <button class="btn btn-icon btn-ghost" data-close-overlay aria-label="Close">✕</button>
+      </div>
+      <form id="key-form" novalidate>
+        <div class="dialog-body">
+          <div class="field">
+            <label for="kf-provider">Provider</label>
+            <select id="kf-provider"></select>
+            <span class="field-hint" id="kf-provider-hint">The relay that bills this account.</span>
+          </div>
+          <div class="field" id="kf-key-field">
+            <label for="kf-key">API key</label>
+            <input type="password" id="kf-key" placeholder="sk-…" autocomplete="off" spellcheck="false">
+            <span class="field-hint">Kept in config.json (mode 600) and appended to keys.jsonl, so it survives a bad save.</span>
+          </div>
+          <div class="field">
+            <label for="kf-label">Account</label>
+            <input type="text" id="kf-label" placeholder="name@example.com" autocomplete="off" spellcheck="false">
+            <span class="field-hint">The login this key came from — what you search for when a balance runs out.</span>
+          </div>
+          <div class="field" id="kf-remaining-field">
+            <label for="kf-remaining">Credit on it</label>
+            <input type="number" id="kf-remaining" step="0.01" min="0" placeholder="e.g. 8.00" autocomplete="off">
+            <span class="field-hint">Optional, and only at this point: after that a balance is measured, not typed
+              (<code>ai-proxy keys check &lt;provider&gt; --balance</code>).</span>
+          </div>
+          <div class="field">
+            <label for="kf-note">Note</label>
+            <input type="text" id="kf-note" placeholder="anything worth remembering about this account" autocomplete="off">
+          </div>
+          <div class="switch-row" id="kf-use-row">
+            <div class="switch-row-text">
+              <strong>Send this one from now on</strong>
+              <span>Otherwise it waits at the end of the pool until the keys ahead of it are spent.</span>
+            </div>
+            <button type="button" class="switch" id="kf-use" role="switch" aria-checked="false"
+                    aria-label="Send this key from now on"></button>
+          </div>
+          <p class="field-error" id="kf-error" hidden></p>
+        </div>
+        <div class="dialog-foot">
+          <button type="button" class="btn" data-close-overlay>Cancel</button>
+          <button type="submit" class="btn btn-primary" id="kf-submit">Add key</button>
         </div>
       </form>
     </div>

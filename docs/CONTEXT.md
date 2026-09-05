@@ -85,7 +85,7 @@ src/
 │
 ├── controllers/
 │   ├── providerController.js   Provider/model CRUD used by the CLI.
-│   ├── keysController.js       The `keys …` commands (import/list/check/switch/export).
+│   ├── keysController.js       The `keys …` commands (import/list/check/add/edit/remove/switch/export).
 │   └── integrationController.js Shell rc + VS Code integration (idempotent blocks).
 │
 ├── utils/
@@ -112,6 +112,7 @@ when that variable is set (used by the tests so they never touch real data).
       "keys": [
         { "id": "9f2c1a44", "label": "you@example.com", "key": "sk-…", "status": "active",
           "remaining": 55.34, "needed": null, "dashboardUrl": "", "referralUrl": "",
+          "note": "tops up monthly",
           "addedAt": "…", "lastUsedAt": "…", "requestsServed": 41, "lastError": null }
       ],
       "selectedKeyId": "9f2c1a44",
@@ -259,6 +260,10 @@ reading your API keys out of `127.0.0.1:8319` via DNS rebinding.
 | `POST` | `/api/keys/:name/retire` | mark spent and move on; `{}` retires the key in use |
 | `POST` | `/api/keys/:name/revive` | put a key back as `unknown` |
 | `POST` | `/api/keys/:name/rotation` | `{mode:'manual'\|'auto'}`; who switches when a key runs out |
+| `POST` | `/api/keys/:name` | add one key by hand; lands as `unknown`, `use:true` selects it |
+| `PATCH` | `/api/keys/:name/:id` | label, note and the two links only; every other field is a `400` |
+| `DELETE` | `/api/keys/:name/:id` | needs `?confirm=1`; the vault line survives |
+| `GET` | `/api/keys/:name/:id/value` | the one call that returns a key value (per-key reveal) |
 | `DELETE` | `/api/keys/:name/alerts/:keyId` | dismiss one alert |
 | `GET` | `/api/logs` | `?limit=&provider=&status=ok\|error\|pending` |
 | `GET` | `/api/logs/:id` | one request plus in-memory body previews |
@@ -284,7 +289,10 @@ Models        set-model <name> <model|""> · add-model <name> <model> · remove-
 Daemon        start [--daemon] [--port n] · stop · restart · status · logs [-n N] [-f] · set-port <n>
 Integrations  setup-terminal · remove-terminal · sync-vscode
 Config        export <file> [--with-keys] · import <file> [--replace] · help · version
-Keys          keys import <file…> [--dry-run] · keys list [name] · keys check [name] [--balance]
+Keys          keys import <file…> [--dry-run] [--create-providers] · keys list [name]
+              keys check [name] [--balance] · keys add <name> <key> --label … [--use]
+              keys edit <name> <n|id|label> … · keys remove <name> <n|id|label> --yes
+              keys reveal <name> <n|id|label>
               keys next|use|retire|revive <name> [n|id|label] · keys rotation <name> [auto|manual]
               keys export [file] [--with-keys]
 ```
@@ -302,7 +310,7 @@ Keys          keys import <file…> [--dry-run] · keys list [name] · keys chec
 
 ## 7. Dashboard
 
-`http://127.0.0.1:8319` — five views (Overview, Providers, Requests, Setup, Settings) in
+`http://127.0.0.1:8319` — six views (Overview, Providers, Keys, Requests, Setup, Settings) in
 one page, no build step, no framework. Screenshots and a per-view tour:
 **[DASHBOARD.md](DASHBOARD.md)**.
 
@@ -328,8 +336,17 @@ Conventions to preserve when editing `dashboard/app.js`:
   (`is-info`, no *Switch* button) because auto rotation has already moved the pool on;
   everything else offers *Switch →*, which is `POST /api/keys/:name/next`.
 - Provider cards carry the pool summary (`N keys · N spent · N dead`) and the `auto` toggle,
-  which flips `keyRotation`. Nothing in the DOM ever holds a key value — the API sends
-  `sk-…a1b2` only, so there is nothing to reveal.
+  which flips `keyRotation`. The **Keys** view holds the pools themselves.
+- **The Keys view addresses every mutation by key id, never by row number** (`data-key-id` on
+  each button). Rows are rebuilt from the 2-second poll, so a position that shifted between
+  the click and the request would retire whichever key had moved into it. It also renders in
+  pool order — the spend order — with the key in use marked in place rather than moved.
+- **`refreshKeys()` runs only while the Keys view is open**, from `setView('keys')` and from
+  `startPolling()`. `/api/keys` returns a row per account (269 in the author's config) and
+  nothing outside the view reads it.
+- A key value enters the DOM in exactly one place: the per-key *reveal*, which calls
+  `GET /api/keys/:name/:id/value` and keeps the result in `state.revealedKeys` until *hide*.
+  Every listing the dashboard renders carries `sk-…a1b2` only.
 
 ---
 
@@ -402,9 +419,14 @@ sent; and every code path either finishes or errors its log entry.
 - `export` redacts keys unless `--with-keys` / `?redact=0` is passed. `keys export` masks by
   the same rule and additionally refuses to write real keys anywhere inside a git working
   tree unless `--force` is given.
-- **The key pool never returns a value.** `/api/keys`, `keyAlerts`, the CLI listings and the
-  dashboard all carry `masked` + `id` + `label`. `requests.jsonl` records `keyId`/`keyLabel`
-  only. `keys.jsonl` does hold values, by design — it is the last line of defence against
+- **The key pool returns a value from exactly one route.** `GET /api/keys/:name/:id/value`,
+  behind the dashboard's per-key reveal and `ai-proxy keys reveal`, addressed by an id the
+  caller had to already hold. Every listing and every mutation response — `/api/keys`,
+  `keyAlerts`, the CLI listings — carries `masked` + `id` + `label`. `requests.jsonl` records
+  `keyId`/`keyLabel` only.
+- **Deleting a key needs saying twice**: `keys remove … --yes` on the CLI, `?confirm=1` on the
+  API, a confirm dialog in the dashboard. Retiring, which keeps the entry, needs none of that
+  — the asymmetry is deliberate. `keys.jsonl` does hold values, by design — it is the last line of defence against
   losing an account — and is `0600` inside the `0700` data directory.
 - A real API key was committed to `docs/SETUP_GUIDE.md` in an early commit and is still in
   git history. It was revoked.

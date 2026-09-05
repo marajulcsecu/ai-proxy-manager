@@ -259,7 +259,7 @@ Every pool, plus the alerts nobody has dismissed.
       "keys": [
         {
           "position": 1, "id": "9f2c1a44", "masked": "sk-fa…000a",
-          "label": "marajul.cu.cse@gmail.com", "status": "active",
+          "label": "marajul.cu.cse@gmail.com", "note": "tops up monthly", "status": "active",
           "remaining": 55.34, "needed": null,
           "requestsServed": 41, "lastUsedAt": "2026-09-03T09:12:44.001Z", "lastError": null,
           "dashboardUrl": "https://gorouter.app/", "referralUrl": "https://gorouter.app/…",
@@ -341,6 +341,71 @@ Dismisses one alert. `{"ok": true, "dismissed": true}`; `dismissed: false` means
 already gone. Alerts also clear themselves once the condition ends — a key that is no longer
 both spent and selected — because the switch may well have happened in the CLI, in another
 process.
+
+### `POST /api/keys/:name`
+
+Adds one key by hand, for an account that never went through a spreadsheet.
+
+```json
+{ "key": "sk-…", "label": "someone@gmail.com", "note": "trial",
+  "dashboardUrl": "https://…", "referralUrl": "https://…",
+  "remaining": 12.5, "use": false }
+```
+
+Only `key` is required. The entry lands at the end of the pool as `unknown` — never `active`,
+because nothing has tested it yet — and `use: true` selects it immediately.
+
+```json
+{ "ok": true, "provider": "gorouter", "position": 13,
+  "entry": { "id": "c7e40a12", "label": "someone@gmail.com", "masked": "sk-fa…000c", "status": "unknown" },
+  "inUse": false, "alsoIn": ["cursorpro"] }
+```
+
+`alsoIn` names the other providers already holding the same key value — worth surfacing,
+because one relay's key pasted under a second name is two entries that empty together. A key
+already in *this* provider's pool is a `400` instead: re-adding it would mean two rows for one
+account, each with its own idea of the balance.
+
+### `PATCH /api/keys/:name/:id`
+
+Corrects what only a person knows: `label`, `note`, `dashboardUrl`, `referralUrl`. Send the
+fields you mean to set; an empty string clears one.
+
+```json
+{ "ok": true, "provider": "gorouter", "changed": ["label", "note"],
+  "entry": { "id": "c7e40a12", "label": "real@gmail.com", "masked": "sk-fa…000c", "status": "unknown" } }
+```
+
+`changed: []` means the pool already said that and nothing was written. Every other field is a
+`400` naming the verb that owns it — `status` follows what a relay answered, `remaining` is
+measured by `keys check`, and the key value cannot be edited at all, because the id is derived
+from it: a new value is a new entry.
+
+### `DELETE /api/keys/:name/:id?confirm=1`
+
+Removes a key from the pool. Without `confirm=1` it is a `400` describing what would go, and
+nothing is written.
+
+```json
+{ "ok": true, "provider": "gorouter", "confirmed": true,
+  "entry": { "id": "c7e40a12", "label": "real@gmail.com", "masked": "sk-fa…000c", "status": "unknown" },
+  "movedTo": { "id": "b31d0c9e", "label": "…", "masked": "sk-fa…000b" } }
+```
+
+`movedTo` is present when the deleted key was the one in use. Deleting is the last resort:
+retiring keeps the entry and its balance, and even after a delete the value survives in
+`keys.jsonl`, which is the copy the tool never rewrites.
+
+### `GET /api/keys/:name/:id/value`
+
+The one call in the API that returns a key value, for the dashboard's per-key reveal.
+
+```json
+{ "ok": true, "provider": "gorouter", "id": "c7e40a12",
+  "label": "real@gmail.com", "status": "unknown", "apiKey": "sk-…" }
+```
+
+Everything else — every listing, every mutation response, every alert — carries `masked` only.
 
 ---
 

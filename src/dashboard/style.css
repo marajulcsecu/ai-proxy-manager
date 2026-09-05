@@ -557,8 +557,10 @@ select.model-select:hover { border-color: var(--border-strong); }
   overflow: hidden;
 }
 .table-scroll { max-height: 460px; overflow: auto; }
-table.log-table { width: 100%; border-collapse: collapse; }
-.log-table th {
+table.log-table,
+table.key-table { width: 100%; border-collapse: collapse; }
+.log-table th,
+.key-table th {
   position: sticky;
   top: 0;
   z-index: 1;
@@ -573,7 +575,8 @@ table.log-table { width: 100%; border-collapse: collapse; }
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
-.log-table td {
+.log-table td,
+.key-table td {
   padding: 7px 12px;
   border-top: 1px solid var(--border);
   font-family: var(--mono);
@@ -934,3 +937,57 @@ pre.code.is-command { color: var(--accent); white-space: pre; }
   .key-alert { flex-wrap: wrap; }
   .key-alert-text { flex-basis: 100%; }
 }
+
+/* ------------------------------------------------------------------ key pools
+   One table per provider, in the order the keys will be spent — so the row
+   position is information, and the key paying right now is marked where it
+   stands rather than moved to the top. */
+.keys-group { margin-bottom: 22px; }
+.keys-group-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.keys-group-head h2 { font-size: 0.95rem; font-weight: 650; }
+.keys-group-head .muted { font-size: 0.75rem; }
+.key-table tbody tr:hover td { background: var(--surface-2); }
+.key-table tr.is-inuse td { background: var(--accent-soft); }
+.key-table tr.is-inuse td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+.key-inuse-mark { color: var(--accent); font-weight: 650; margin-left: 6px; }
+.key-status { font-weight: 650; }
+.key-status.is-active { color: var(--ok); }
+.key-status.is-unknown { color: var(--text-3); }
+.key-status.is-exhausted { color: var(--warn); }
+.key-status.is-invalid { color: var(--danger); }
+/* Disabled is a decision rather than a measurement, so it reads as struck out
+   instead of as another shade of failure. */
+.key-status.is-disabled { color: var(--text-3); text-decoration: line-through; }
+/* Four columns and no more: status, account, key, buttons. `display: flex` on a
+   <td> is what pulled the old nine-column table apart — a flex cell stops being
+   a table cell, so the rows stopped lining up with the header above them. These
+   lay out as table cells, and a fixed layout holds the widths steady whatever a
+   row happens to contain. */
+.key-table { table-layout: fixed; }
+.key-table th:nth-child(1), .key-table td:nth-child(1) { width: 112px; }
+.key-table th:nth-child(3), .key-table td:nth-child(3) { width: 300px; }
+.key-table th:nth-child(4), .key-table td:nth-child(4) { width: 200px; text-align: right; }
+/* The gmail is what the user recognises an account by, so it takes whatever
+   width the other three leave and the note sits under it. */
+.key-account { overflow: hidden; }
+.key-account > span { display: block; overflow: hidden; text-overflow: ellipsis; }
+.key-account .dim { font-size: 0.7rem; margin-top: 2px; }
+/* Masked, a key is short; revealed, it is long — so a revealed key wraps onto a
+   second line rather than being cut off, because it is there to be copied. */
+.key-cell { white-space: normal; }
+.key-cell > span { word-break: break-all; }
+.key-cell .key-reveal { margin-left: 6px; white-space: nowrap; }
+/* A revealed key exists to be copied, so one click selects the whole thing. */
+.key-shown { user-select: all; }
+.key-row-actions { white-space: nowrap; }
+.key-row-actions .key-reveal + .key-reveal { margin-left: 4px; }
+.key-reveal.is-danger { color: var(--danger); }
+.key-reveal.is-danger:hover { color: var(--danger); border-color: var(--danger); }
+.keys-more { display: flex; align-items: center; gap: 10px; padding: 8px 2px 0; }
+.keys-more .dim { font-size: 0.72rem; }

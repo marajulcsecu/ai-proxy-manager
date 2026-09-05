@@ -85,19 +85,62 @@ All notable changes to this project are documented here. The format follows
   socket destroyed on the first byte is what caps the cost if a key *is* rich enough to be
   accepted. Liveness can promote `unknown` → `active` but never revives a spent key, a control
   probe with an invented key catches relays that accept anything, and `disabled` is a decision
-  a measurement does not undo.
+  a measurement does not undo. A figure is written only where the relay quoted one: an accepted
+  probe proves a key *has* credit, not how much, so the balance already on the entry stands
+  instead of being replaced by a blank — and a key whose status and balance both come back
+  unchanged costs no save at all.
+
+  *Adding and correcting by hand.* Not every account arrives in a spreadsheet.
+  `ai-proxy keys add <provider> <key> --label me@gmail.com [--note …] [--credit N] [--use]`
+  appends one as `unknown` at the end of the pool, so adding a key never changes which account
+  is serving traffic unless asked. An exact duplicate inside the same provider is refused —
+  two rows for one account would each keep their own idea of the balance — while the same key
+  under a *different* provider is allowed and reported, because those entries will empty
+  together. `keys edit` corrects only what a person knows (label, note, dashboard and referral
+  links): a key value cannot be edited because the id is derived from it, `status` follows what
+  a relay answered, and `remaining` is measured by `keys check`; asking to set any of those is
+  an error naming the verb that owns it. Editing to what the pool already says writes nothing,
+  since a pointless save would rotate a real backup off the end of the five. `keys remove`
+  needs `--yes`, moves the selection on as `keys next` would, and still leaves the value in
+  `keys.jsonl`.
+
+  *The models column.* An import also fills each provider's model list from a `Top Models`
+  column, found by its header rather than its contents. What it accepts is filtered hard —
+  anything with a space is prose, and every real id carries a digit or a hyphen — because one
+  row writes "ALL KINDS OF MODELS" one word per line, and an invented model reaches the
+  dashboard's dropdown and then 404s from the relay far from the import that made it up.
+  Models are only added, never pruned. `--create-providers` builds providers the sheet names
+  and the config lacks, from the URLs in the sheet, then re-reads the whole file so the same
+  resolution rules apply to those keys as to every other one.
+
+  *The Keys view.* The dashboard grew a sixth view: every account the proxy can bill, one table
+  per provider, **in the order the keys will be spent** — the key in use is marked where it
+  stands rather than lifted to the top, because its position in the queue is the information.
+  Four columns, and deliberately only four: status, the account and its note, the masked key
+  with a reveal, and *use* / *retire* / *revive* / *edit* / *delete*. The balance, the request
+  count, the last-used time and the account's dashboard and referral links stay recorded — the
+  CLI and the exported CSV carry them — they are simply not what this view is for. Filter by
+  provider, by status or by a search over account, note and masked key; first 25 rows per
+  provider with a *Show all N* toggle. Every button carries the key id, never the row number: the table is rebuilt from a
+  2-second poll, and a position that shifted between the click and the request would retire
+  whichever key had moved into it. The view polls only while it is open — one row per account
+  is the largest response the API serves.
 
   *Not losing keys.* Four copies: `config.json` (atomic, `0600`), its five rotating backups,
   the append-only `keys.jsonl` vault that `config.json` can be rebuilt from, and
   `ai-proxy keys export [file] [--with-keys]` — a CSV in the same column order the importer
   reads, so it is a genuine restore. The export is masked unless asked, `0600`, and refused
-  inside a git working tree unless forced. Nothing is ever deleted: spent and revoked keys stay
-  in the pool, and no API or page returns a key value.
+  inside a git working tree unless forced. Nothing is deleted unless you say so twice: spent
+  and revoked keys stay in the pool, `keys remove` needs `--yes` and the API needs `confirm=1`,
+  and the vault line survives either way. Exactly one call returns a key value — the per-key
+  reveal — and every listing, alert and response carries a masked key only.
 
-  *Commands and API.* `keys import|list|check|next|use|retire|revive|rotation|export`,
-  `GET /api/keys`, `POST /api/keys/:name/{next,use,retire,revive,rotation}`,
-  `DELETE /api/keys/:name/alerts/:keyId`, `keyAlerts` on `/api/status`, and per-provider pool
-  cards with an `auto` toggle in the dashboard.
+  *Commands and API.*
+  `keys import|list|check|add|edit|remove|reveal|next|use|retire|revive|rotation|export`,
+  `GET /api/keys`, `POST /api/keys/:name` and `/api/keys/:name/{next,use,retire,revive,rotation}`,
+  `PATCH /api/keys/:name/:id`, `DELETE /api/keys/:name/:id?confirm=1`,
+  `GET /api/keys/:name/:id/value`, `DELETE /api/keys/:name/alerts/:keyId`, `keyAlerts` on
+  `/api/status`, per-provider pool cards with an `auto` toggle, and the Keys view.
 
 ## [1.1.0] — 2026-08-28
 

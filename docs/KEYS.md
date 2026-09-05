@@ -60,9 +60,13 @@ request can still answer a small one; only `invalid` and `disabled` are never se
 ## Commands
 
 ```bash
-ai-proxy keys import <file…> [--dry-run]   # .xlsx or .csv, any number of files
+ai-proxy keys import <file…> [--dry-run] [--create-providers]   # .xlsx or .csv, any number
 ai-proxy keys list [provider]              # the pools, with balances and which key is in use
 ai-proxy keys check [provider] [--balance] # probe every key: accepted, spent or revoked
+ai-proxy keys add <provider> <key> --label me@gmail.com [--note …] [--credit N] [--use]
+ai-proxy keys edit <provider> <n|id|label> [--label …] [--note …] [--dashboard …] [--referral …]
+ai-proxy keys remove <provider> <n|id|label> --yes   # delete; the vault still keeps it
+ai-proxy keys reveal <provider> <n|id|label>   # print one key in full
 ai-proxy keys next <provider>              # switch to the next usable key
 ai-proxy keys use <provider> <n|id|label>  # switch to a specific one
 ai-proxy keys retire <provider> [n|id|label]   # mark spent and move on
@@ -71,9 +75,39 @@ ai-proxy keys rotation <provider> [auto|manual]
 ai-proxy keys export [file] [--with-keys]  # the CSV second copy
 ```
 
-The dashboard mirrors all of it except `import`, `check` and `export`, which are CLI-only:
-the first two want streaming progress over a run that takes minutes, and the third writes a
-file to a path you choose.
+Anywhere a key is named, `<n|id|label>` accepts its position in the pool, its id, or the
+account label — whichever you have in front of you.
+
+The dashboard's **Keys** view mirrors all of it except `import`, `check` and `export`, which
+are CLI-only: the first two want streaming progress over a run that takes minutes, and the
+third writes a file to a path you choose. See
+**[DASHBOARD.md](DASHBOARD.md#keys)**.
+
+## Adding and correcting by hand
+
+Not every account arrives in a spreadsheet. `keys add` appends one:
+
+```bash
+ai-proxy keys add gorouter sk-… --label me@gmail.com --note "trial" --credit 5 --use
+```
+
+It lands as `unknown` — never `active`, because nothing has tested it — at the end of the
+pool, so adding a key never changes which account is serving traffic unless `--use` says so.
+An exact duplicate within the same provider is refused: two rows for one account would each
+keep their own idea of the balance. The same key under a *different* provider is allowed and
+reported, because one relay's key pasted under a second name is a real thing to know about —
+those two entries will empty together.
+
+`keys edit` corrects only what a person knows: the label, the note and the two links. The key
+value itself cannot be edited, because the id is derived from it — a new value is a new entry,
+so add it and remove the old one. `status` follows what a relay actually answered and
+`remaining` is measured by `keys check`; asking to set either is an error naming the verb that
+owns it. Editing to what the pool already says writes nothing at all: a pointless save would
+rotate a real backup off the end of the five.
+
+`keys remove` needs `--yes`. It is the last resort, and rarely the right one — retiring keeps
+the entry, its label and its balance, and stops it being sent. Even after a remove the value
+survives in `keys.jsonl`, which is the one file the tool never rewrites.
 
 ## Importing
 
@@ -96,6 +130,27 @@ Four rules, all of them about not losing keys:
 
 `--dry-run` prints the whole plan — added, updated, unchanged, skipped, unresolved — and
 writes nothing.
+
+### The models column
+
+A `Top Models` column, where the sheet has one, fills the provider's model list. The column is
+found by its header rather than by its contents, because a model id looks like an ordinary
+hyphenated word and content detection would read a provider name or a note as a model. What it
+takes from that cell is filtered hard: anything with a space in it is prose, and every real id
+in the inventory carries a digit or a hyphen (`claude-opus-5`, `gpt-5.6-sol`). One row writes
+"ALL KINDS OF MODELS" one word per line — four entries that would have reached the dashboard's
+dropdown and 404'd from the relay much later, far from the import that invented them. Models
+belong to the row rather than to the key, so they are collected even from a key that was
+already known, and they are only ever added: a list you curated is never pruned by a sheet.
+
+### `--create-providers`
+
+An unresolved key usually means the sheet names a provider the config does not have.
+`--create-providers` builds those from the URL in the sheet — opt-in, because it adds a host
+the proxy will then send keys to. When it fires, the whole file is read again rather than the
+leftovers being patched up: the same resolution rules then apply to these keys as to every
+other one, and the accounting that refuses a lossy import still counts every key-shaped cell
+exactly once. Run it with `--dry-run` first to see which providers it would invent.
 
 ## How "out of credit" is detected
 
@@ -165,7 +220,7 @@ Two probes per key, both effectively free:
    balance can pre-pay. The relay refuses and quotes the number. Nothing ran, so nothing was
    billed.
 
-Four properties worth knowing before you read the output:
+Five properties worth knowing before you read the output:
 
 - **A refusal is a measurement, not a verdict.** A $200 key is refused exactly as a $0.71 key
   is. Only the quoted number decides, against `--low` (default `$1`).
@@ -177,6 +232,11 @@ Four properties worth knowing before you read the output:
   provider also gets one control probe with an invented key — a relay that answers `200` to
   that is not checking keys at all, so its liveness results promote nothing and are called out.
 - **`disabled` is a decision, not a measurement**, and a funded probe does not undo it.
+- **A balance is written where a number was quoted, and left alone where none was.** A relay
+  rich enough to accept the probe has said the key *has* credit, not how much. Plenty of relays
+  never quote a figure at all, so a check that wrote the entry regardless would erase every
+  balance the import filled in; the last figure anyone actually has stands instead. A key whose
+  status and balance both come back unchanged is not written at all.
 
 One config write for the whole run, and none when nothing was learned.
 
@@ -230,8 +290,10 @@ ai-proxy keys import ~/keys-backup.csv
 
 ## Nothing leaks
 
-- No API returns a key value. `/api/keys`, `/api/providers`, `/api/status` and the dashboard
-  all carry `masked` only.
+- Exactly one call returns a key value: `GET /api/keys/:name/:id/value`, behind the
+  dashboard's per-key *reveal* button and `ai-proxy keys reveal`. Every listing, every
+  mutation response and every alert — `/api/keys`, `/api/providers`, `/api/status` — carries
+  `masked` only, so a key reaches the screen only when someone asked for that key by name.
 - `requests.jsonl` records `keyId` and `keyLabel` — never a key.
 - `keys.jsonl` and `config.json` are `0600`, the data directory is `0700`, and both are outside
   any repository.
@@ -248,5 +310,6 @@ ai-proxy keys import ~/keys-backup.csv
 | `src/core/keyMonitor.js` | the only pool code on the request path |
 | `src/core/keyCheck.js` | liveness and balance probes |
 | `src/controllers/keysController.js` | the `keys …` commands |
+| `src/dashboard/app.js` | the Keys view: `keyRowHtml` → `keyGroupHtml` → `renderKeys` |
 
 Design decisions and their reasons: [KEY-POOL-PLAN.md](KEY-POOL-PLAN.md).

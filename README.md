@@ -85,7 +85,7 @@ claude                         # Claude Code now talks to the proxy
 
 ## Dashboard
 
-Five views on one page, served from the proxy's own port.
+Six views on one page, served from the proxy's own port.
 
 **Providers** — add, edit and delete providers; switch the pinned model from a dropdown;
 reveal a masked key; test a provider and see the verdict inline.
@@ -93,6 +93,10 @@ reveal a masked key; test a provider and see the verdict inline.
 <div align="center">
   <img src="docs/images/dashboard-providers.png" alt="The Providers view: provider cards with model dropdowns, masked keys and an inline test result" width="820">
 </div>
+
+**Keys** — every account the proxy can bill, one table per provider, in the order they will
+be spent. Status, the gmail it belongs to, the balance, a per-key reveal, and *use* / *retire* /
+*revive* / *edit* / *delete* per row. Filter by provider, status or account; add a key by hand.
 
 **Requests** — filterable history with latency, model swaps and status. Select a row for
 timings, byte counts, the resolved upstream URL and the full bodies.
@@ -124,7 +128,7 @@ anywhere. Light and dark themes follow your system by default. More:
 | `status` · `logs [-n N] [-f]` | State overview · daemon log |
 | `set-port <n>` | Change the listening port |
 | `setup-terminal` · `remove-terminal` · `sync-vscode` | Tool integrations |
-| `keys <import\|list\|check\|next\|use\|retire\|revive\|rotation\|export>` | Many accounts per provider — see [below](#many-keys-per-provider) |
+| `keys <import\|list\|check\|add\|edit\|remove\|reveal\|next\|use\|retire\|revive\|rotation\|export>` | Many accounts per provider — see [below](#many-keys-per-provider) |
 | `export <file> [--with-keys]` · `import <file> [--replace]` | Move config between machines |
 | `help` · `version` | |
 
@@ -137,10 +141,14 @@ one, and notices when that account runs out of credit.
 ai-proxy keys import ~/accounts.xlsx --dry-run   # read the spreadsheet, write nothing
 ai-proxy keys check --balance                    # what is each key worth, without spending
 ai-proxy keys list gorouter                      # the pool, with the key in use marked
+ai-proxy keys add gorouter sk-… --label me@gmail.com   # or add one by hand
 ai-proxy keys next gorouter                      # switch account by hand
 ai-proxy keys rotation gorouter auto             # …or let that provider do it itself
 ai-proxy keys export ~/keys-backup.csv --with-keys
 ```
+
+The dashboard's **Keys** view does all of that except import, check and export, which run for
+minutes over hundreds of keys and want streaming progress.
 
 Detection is not a guess about billing. These relays pre-authorise a request against the
 balance and refuse it *before* running it, quoting the shortfall — so a `403` carrying
@@ -155,8 +163,9 @@ Default is **manual**: the dashboard shows *"gorouter key marajul.cu.cse is out 
 accounts per request.
 
 Keys are kept in four places so they cannot be lost: `config.json`, its five rotating
-backups, the append-only `keys.jsonl` vault, and the CSV you export. No API or page ever
-returns a key value.
+backups, the append-only `keys.jsonl` vault, and the CSV you export. Exactly one call returns
+a key value — the per-key *reveal* — and every listing, alert and response carries a masked
+key only.
 
 Full reference: **[docs/KEYS.md](docs/KEYS.md)**.
 

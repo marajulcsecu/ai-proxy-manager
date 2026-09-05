@@ -17,7 +17,9 @@ import { getLogs, getLogById, getStatus, clearLogs, configureLogger } from './re
 import { parseProviderUrl } from './upstream.js';
 import { maskKey, selectKey } from './keyStore.js';
 import { keyAlerts, dismissKeyAlert } from './keyMonitor.js';
-import { nextKey, useKey, retireKey, reviveKey, setRotation } from '../controllers/keysController.js';
+import {
+  nextKey, useKey, retireKey, reviveKey, setRotation, addKey, editKey, removeKey, revealKey
+} from '../controllers/keysController.js';
 import { testProvider } from './providerTester.js';
 import { getDaemonStatus } from './daemon.js';
 import { getRuntime } from './runtime.js';
@@ -350,6 +352,9 @@ function keyPoolView(name, data) {
     id: entry.id,
     masked: maskKey(entry.key),
     label: entry.label,
+    // Typed by the user and recorded nowhere else, so an editor that could not
+    // read it back would blank it on the next save.
+    note: entry.note,
     status: entry.status,
     remaining: entry.remaining,
     needed: entry.needed,
@@ -427,6 +432,50 @@ route('POST', new RegExp(`^/api/keys/(${NAME})/rotation$`), async ({ req, res, p
 
 route('DELETE', new RegExp(`^/api/keys/(${NAME})/alerts/([a-f0-9]+)$`), ({ res, params }) => {
   sendJSON(res, 200, { ok: true, dismissed: dismissKeyAlert(params[0], params[1]) });
+});
+
+// Managing the pool by hand. `POST /api/keys/:name` takes a key value in, and
+// `GET …/value` is the one route that gives one back — deliberately separate
+// from every listing, so no bulk response can ever grow a key field by accident.
+
+route('POST', new RegExp(`^/api/keys/(${NAME})$`), async ({ req, res, params }) => {
+  const body = await parseBody(req);
+  const credit = Number(body.remaining ?? body.credit);
+  const { entry, position, inUse, alsoIn } = addKey(params[0], body.key ?? body.apiKey, {
+    label: body.label ?? body.account,
+    note: body.note,
+    dashboardUrl: body.dashboardUrl,
+    referralUrl: body.referralUrl,
+    remaining: Number.isFinite(credit) ? credit : undefined,
+    use: Boolean(body.use)
+  });
+  sendJSON(res, 200, { ok: true, provider: params[0], entry: keyRef(entry), position, inUse, alsoIn });
+});
+
+route('PATCH', new RegExp(`^/api/keys/(${NAME})/([a-f0-9]+)$`), async ({ req, res, params }) => {
+  // The body is forwarded as it arrived: a field the pool does not let anyone
+  // type — a status, a balance — has to come back as an error naming the verb
+  // that owns it, not be dropped in silence here.
+  const body = await parseBody(req);
+  const { entry, changed } = editKey(params[0], params[1], body);
+  sendJSON(res, 200, { ok: true, provider: params[0], entry: keyRef(entry), changed });
+});
+
+route('DELETE', new RegExp(`^/api/keys/(${NAME})/([a-f0-9]+)$`), ({ res, params, query }) => {
+  const confirm = String(query.get('confirm') ?? '').toLowerCase();
+  const { entry, movedTo, poolSize } = removeKey(params[0], params[1], {
+    confirmed: ['1', 'true', 'yes'].includes(confirm)
+  });
+  sendJSON(res, 200, {
+    ok: true, provider: params[0], entry: keyRef(entry), movedTo: keyRef(movedTo), poolSize
+  });
+});
+
+route('GET', new RegExp(`^/api/keys/(${NAME})/([a-f0-9]+)/value$`), ({ res, params }) => {
+  const { entry, key } = revealKey(params[0], params[1]);
+  sendJSON(res, 200, {
+    ok: true, provider: params[0], id: entry.id, label: entry.label, status: entry.status, apiKey: key
+  });
 });
 
 // ----------------------------------------------------------------------- logs
@@ -576,7 +625,7 @@ export async function handleApiRequest(req, res, pathname) {
   const routePath = pathname || url.pathname;
 
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { Allow: 'GET, POST, PUT, DELETE, OPTIONS' });
+    res.writeHead(204, { Allow: 'GET, POST, PUT, PATCH, DELETE, OPTIONS' });
     res.end();
     return true;
   }

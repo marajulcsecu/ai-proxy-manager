@@ -10,8 +10,8 @@
 import fs from 'fs';
 import path from 'path';
 import { loadConfig, saveConfig, CONFIG_DIR } from '../core/configManager.js';
-import { selectKey, nextKeyId, applyKeyVerdict, maskKey, KEY_ROTATION_MODES } from '../core/keyStore.js';
-import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, RE_KEY } from '../core/keyImport.js';
+import { selectKey, nextKeyId, applyKeyVerdict, maskKey, deriveKeyId, KEY_ROTATION_MODES } from '../core/keyStore.js';
+import { readSpreadsheet, extractKeyRecords, mergeKeyRecords, planProviders, RE_KEY } from '../core/keyImport.js';
 import { checkKeys, DEFAULT_LOW } from '../core/keyCheck.js';
 import { Logger } from '../utils/logger.js';
 import { UsageError } from '../utils/errors.js';
@@ -77,7 +77,30 @@ export function importKeys(files, options = {}) {
   }
 
   const config = loadConfig();
-  const found = extractKeyRecords(sheets, { providers: config.providers });
+  // A copy, because loadConfig() hands out the object the proxy reads on every
+  // request: a provider built into it directly would take effect before it was
+  // saved, and after a dry run it would never be saved at all.
+  let providers = config.providers;
+  let found = extractKeyRecords(sheets, { providers });
+  let created = [];
+
+  // A provider the sheet knows and the config does not. Creating one is opt-in:
+  // it adds a host the proxy will send keys to. Once created, the whole file is
+  // read again rather than the leftovers being patched up by hand — the same
+  // resolution rules then apply to these keys as to every other one, and the
+  // accounting below still counts every key-shaped cell exactly once.
+  if (options.createProviders && found.unresolved.length) {
+    const plan = planProviders(found.unresolved, providers);
+    if (plan.create.length) {
+      created = plan.create;
+      providers = { ...providers };
+      for (const provider of plan.create) {
+        providers[provider.name] = { url: provider.url, keys: [], models: [], defaultModel: '' };
+      }
+      found = extractKeyRecords(sheets, { providers });
+    }
+  }
+
   const accounting = accountFor(sheets, found);
 
   if (accounting.lost.length) {
@@ -87,7 +110,7 @@ export function importKeys(files, options = {}) {
     );
   }
 
-  const merged = mergeKeyRecords(config, found.records);
+  const merged = mergeKeyRecords({ ...config, providers }, found.records);
   if (!options.dryRun) saveConfig(merged.config);
 
   const summary = {
@@ -99,6 +122,8 @@ export function importKeys(files, options = {}) {
     updated: merged.updated,
     unchanged: merged.unchanged,
     skipped: merged.skipped,
+    modelsAdded: merged.modelsAdded,
+    created,
     unresolved: found.unresolved,
     warnings: found.warnings,
     lost: accounting.lost,
@@ -119,6 +144,13 @@ function reportImport(summary) {
 
   const pools = Object.entries(summary.pools).map(([name, count]) => `${name} ${count}`).join(' · ');
   if (pools) Logger.plain(`  Pools       ${pools}`);
+  if (summary.modelsAdded) Logger.plain(`  Models      ${summary.modelsAdded} new name(s) from the sheet`);
+
+  for (const provider of summary.created) {
+    Logger.success(`Created provider ${provider.name} → ${provider.url} (${provider.keys.length} key(s))`);
+    Logger.dim('    The sheet only holds the dashboard link, so the API base is a guess at /v1 of it.');
+    Logger.dim(`    Check it: ai-proxy test ${provider.name}   ·   change it: ai-proxy add-provider ${provider.name} <url>`);
+  }
 
   if (summary.unresolved.length) {
     const byHint = new Map();
@@ -128,7 +160,10 @@ function reportImport(summary) {
     }
     Logger.warn(`${summary.unresolved.length} key(s) belong to no configured provider and were left out:`);
     for (const [hint, count] of byHint) Logger.dim(`    ${count} × ${hint}`);
-    Logger.dim('    Add the provider (ai-proxy add-provider <name> <url>) and import again.');
+    // Only worth suggesting when the sheet actually held a URL to point at.
+    Logger.dim(summary.unresolved.some(item => item.url)
+      ? '    Re-run with --create-providers to build them from the URLs in the sheet.'
+      : '    Add the provider (ai-proxy add-provider <name> <url>) and import again.');
   }
 
   if (summary.warnings.length) {
@@ -166,6 +201,13 @@ function requireKey(provider, selector) {
   const keys = provider.keys || [];
   const wanted = String(selector ?? '').trim();
   if (!wanted) throw new UsageError('Which key? Give its number from `ai-proxy keys list`, its id, or its label.');
+
+  // An exact id wins before anything is guessed. An id is 12 hex characters, so
+  // roughly one in 200 contains no letters at all, and read as a position such
+  // an id is "out of range" — which would make that key unreachable from the
+  // dashboard, where ids are the only thing sent.
+  const byId = keys.findIndex(entry => entry.id === wanted.toLowerCase());
+  if (byId >= 0) return { entry: keys[byId], index: byId };
 
   if (/^\d+$/.test(wanted)) {
     const index = Number(wanted) - 1;
@@ -372,6 +414,269 @@ export function reviveKey(providerName, selector) {
   Logger.success(`${entry.label || maskKey(entry.key)} is back in ${name}'s pool as untested.`);
   Logger.dim(`  Send it a request to confirm: ai-proxy keys use ${name} ${index + 1} && ai-proxy test ${name}`);
   return { provider: name, entry: keys[index] };
+}
+
+// --- keeping the pool by hand ------------------------------------------------
+//
+// The spreadsheet these keys came from could do four things this tool could not:
+// add a row, correct a typo, delete a row, and show you a key. Until it can do
+// all four the spreadsheet is still the real record, and this is only a cache.
+
+/**
+ * A provider object carrying a new pool, with no stale `apiKey` mirror.
+ *
+ * The mirror is an *output* of normalization, so handing the old value back as
+ * input resurrects a key that was just removed: a lone `apiKey` is read as a
+ * pre-pool config whose one key must not be lost. Every write of a pool goes
+ * through here so that cannot happen by omission.
+ *
+ * @param {Object} provider - normalized provider
+ * @param {Array<Object>} keys
+ * @param {string} [selectedKeyId]
+ * @returns {Object}
+ */
+function withPool(provider, keys, selectedKeyId = provider.selectedKeyId) {
+  const { apiKey: _mirror, ...rest } = provider;
+  return { ...rest, keys, selectedKeyId };
+}
+
+/** Fields a user may edit. Status has its own verbs; a balance is measured. */
+const EDITABLE_FIELDS = ['label', 'note', 'dashboardUrl', 'referralUrl'];
+
+/** Where a field that is not editable is dealt with instead. */
+const FIELD_OWNER = {
+  key: 'A key value cannot be edited — add the new one and remove this entry.',
+  status: 'Status follows what happened: ai-proxy keys retire|revive|use <provider> <n>',
+  remaining: 'A balance is measured, not typed: ai-proxy keys check <provider> --balance',
+  needed: 'A balance is measured, not typed: ai-proxy keys check <provider> --balance',
+  id: 'The id is derived from the key itself, so it cannot be set.',
+  requestsServed: 'Counted by the proxy as it serves requests.',
+  lastUsedAt: 'Recorded by the proxy as it serves requests.',
+  lastError: 'Recorded from the last refusal the proxy saw.'
+};
+
+/**
+ * Sanity-checks a pasted key without assuming a vendor's prefix.
+ *
+ * Only two things are actually wrong here: nothing, and something that clearly
+ * came with the surrounding text. Relays use their own formats, so `sk-` is not
+ * required — a rule that rejected a real key would be worse than one that
+ * accepted a typo the next request reports anyway.
+ * @param {string} value
+ * @returns {string}
+ */
+function requireKeyValue(value) {
+  const key = String(value ?? '').trim();
+  if (!key) {
+    throw new UsageError('No key given.', 'ai-proxy keys add <provider> <key> --label <account>');
+  }
+  if (/\s/.test(key)) {
+    throw new UsageError(
+      'That key has whitespace in it, so it was probably pasted with something else.',
+      'Paste the key on its own, with no quotes or label attached.'
+    );
+  }
+  if (key.length < 16) {
+    throw new UsageError(
+      `'${key}' is too short to be an API key.`,
+      'Relay keys run to 40 characters or more — check what was copied.'
+    );
+  }
+  return key;
+}
+
+/**
+ * Adds a key by hand, with the account it belongs to.
+ *
+ * Appended at the end and marked `unknown`: the pool is drained in order, so a
+ * new key must never displace the one that is currently working, and nothing
+ * has confirmed this one yet. `use: true` is how to say "send this one now".
+ *
+ * @param {string} providerName
+ * @param {string} keyValue
+ * @param {{label?: string, note?: string, dashboardUrl?: string, referralUrl?: string,
+ *          remaining?: number, use?: boolean}} [options]
+ * @returns {{provider: string, entry: Object, position: number, inUse: boolean, alsoIn: string[]}}
+ */
+export function addKey(providerName, keyValue, options = {}) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const key = requireKeyValue(keyValue);
+  const keys = provider.keys || [];
+
+  const already = keys.findIndex(entry => entry.key === key);
+  if (already >= 0) {
+    const entry = keys[already];
+    throw new UsageError(
+      `${name} already has that key, as #${already + 1}${entry.label ? ` (${entry.label})` : ''}.`,
+      `Change what it says about it instead: ai-proxy keys edit ${name} ${already + 1} --label <account>`
+    );
+  }
+
+  // Pasting a key under the wrong relay is the mistake worth catching. It is
+  // still added — the same account can legitimately be listed twice — but the
+  // user is told where else that value already lives.
+  const alsoIn = Object.entries(config.providers)
+    .filter(([other, data]) => other !== name && (data.keys || []).some(entry => entry.key === key))
+    .map(([other]) => other);
+
+  const raw = {
+    key,
+    status: 'unknown',
+    label: options.label,
+    note: options.note,
+    dashboardUrl: options.dashboardUrl,
+    referralUrl: options.referralUrl,
+    remaining: options.remaining
+  };
+
+  // Saved first, then read back: what is reported is what reached the file,
+  // normalization and all, rather than what this function meant to write.
+  const saved = saveConfig({
+    ...config,
+    providers: {
+      ...config.providers,
+      [name]: withPool(provider, [...keys, raw], options.use ? deriveKeyId(key) : provider.selectedKeyId)
+    }
+  });
+
+  const pool = saved.providers[name].keys;
+  const index = pool.findIndex(entry => entry.key === key);
+  const entry = pool[index];
+  const inUse = selectKey(pool, saved.providers[name].selectedKeyId)?.id === entry.id;
+
+  Logger.success(`Added ${entry.label || maskKey(entry.key)} to ${name} as #${index + 1} (untested).`);
+  if (alsoIn.length) {
+    Logger.warn(`That same key is also in ${alsoIn.join(', ')} — check it went to the right provider.`);
+  }
+  if (inUse) Logger.plain(`  ${name} now uses it.`);
+  else Logger.dim(`  Put it in service when the current one runs out: ai-proxy keys use ${name} ${index + 1}`);
+  return { provider: name, entry, position: index + 1, inUse, alsoIn };
+}
+
+/**
+ * Corrects what the pool says about a key: which account, which dashboard, any
+ * note. Everything else is either derived or measured, and says so.
+ *
+ * A field left out is left alone; a field given as an empty string is cleared.
+ * Nothing is written when nothing actually differs, because a save rotates a
+ * real backup off the end of the five.
+ *
+ * @param {string} providerName
+ * @param {string|number} selector - position, id prefix or account substring
+ * @param {Object} fields
+ * @returns {{provider: string, entry: Object, changed: string[]}}
+ */
+export function editKey(providerName, selector, fields = {}) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const { entry, index } = requireKey(provider, selector);
+
+  const given = Object.keys(fields).filter(field => fields[field] !== undefined);
+  const refused = given.filter(field => !EDITABLE_FIELDS.includes(field));
+  if (refused.length) {
+    throw new UsageError(
+      `${refused.join(', ')} ${refused.length > 1 ? 'are' : 'is'} not something you edit by hand.`,
+      refused.map(field => `  ${field}: ${FIELD_OWNER[field] || 'Not an editable field.'}`).join('\n')
+    );
+  }
+
+  const updated = { ...entry };
+  const changed = [];
+  for (const field of EDITABLE_FIELDS) {
+    if (fields[field] === undefined) continue;
+    const value = String(fields[field] ?? '').trim();
+    if (value === entry[field]) continue;
+    updated[field] = value;
+    changed.push(field);
+  }
+
+  if (!changed.length) {
+    Logger.info(`${entry.label || maskKey(entry.key)} already says that — nothing written.`);
+    return { provider: name, entry, changed };
+  }
+
+  const keys = [...provider.keys];
+  keys[index] = updated;
+  const saved = saveConfig({ ...config, providers: { ...config.providers, [name]: withPool(provider, keys) } });
+  const result = saved.providers[name].keys[index];
+
+  Logger.success(`Updated ${result.label || maskKey(result.key)} in ${name} (${changed.join(', ')}).`);
+  return { provider: name, entry: result, changed };
+}
+
+/**
+ * Drops a key from the pool.
+ *
+ * Marking a key spent is `keys retire`; this is for a key that should not be in
+ * the list at all — a duplicate, a wrong paste, a closed account. It takes an
+ * explicit yes because the config is the copy everything else reads, and it
+ * still leaves the append-only vault line behind, so the value is recoverable
+ * even after this.
+ *
+ * @param {string} providerName
+ * @param {string|number} selector
+ * @param {{confirmed?: boolean}} [options]
+ * @returns {{provider: string, entry: Object, position: number, movedTo: Object|null, poolSize: number}}
+ */
+export function removeKey(providerName, selector, options = {}) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const { entry, index } = requireKey(provider, selector);
+  const shown = entry.label || maskKey(entry.key);
+
+  if (!options.confirmed) {
+    throw new UsageError(
+      `That would delete ${shown} from ${name}'s pool.`,
+      `Confirm it and the value stays only in ${path.join(CONFIG_DIR, 'keys.jsonl')}`
+        + ` — the dashboard asks, the CLI takes --yes. To keep the key but stop sending it:`
+        + ` ai-proxy keys retire ${name} ${index + 1}`
+    );
+  }
+
+  const inUse = selectKey(provider.keys, provider.selectedKeyId)?.id === entry.id;
+  const keys = provider.keys.filter((_, at) => at !== index);
+  // A selection pointing at a key that is gone would leave the provider with no
+  // mirror to send, so it moves on exactly as `keys next` would have moved it.
+  const toId = inUse ? nextKeyId(provider.keys, entry.id) : null;
+  const movedTo = toId ? keys.find(k => k.id === toId) ?? null : null;
+  const selectedKeyId = inUse ? (movedTo?.id ?? '') : provider.selectedKeyId;
+
+  const saved = saveConfig({
+    ...config,
+    providers: { ...config.providers, [name]: withPool(provider, keys, selectedKeyId) }
+  });
+
+  Logger.success(`Removed ${shown} from ${name}.`);
+  Logger.dim(`  Still in ${path.join(CONFIG_DIR, 'keys.jsonl')} if that was a mistake.`);
+  if (movedTo) Logger.plain(`  ${name} now uses ${movedTo.label || maskKey(movedTo.key)} (${movedTo.status}).`);
+  else if (inUse) Logger.warn(`${name} has no key left to send.`);
+
+  return {
+    provider: name,
+    entry,
+    position: index + 1,
+    movedTo,
+    poolSize: saved.providers[name].keys.length
+  };
+}
+
+/**
+ * Reads one key back in full.
+ *
+ * Deliberately silent: the caller decides where the value goes. The CLI prints
+ * it, the API returns it over loopback, and neither writes it to a log — a
+ * `Logger` call here would put keys in the daemon's own output.
+ *
+ * @param {string} providerName
+ * @param {string|number} selector
+ * @returns {{provider: string, entry: Object, key: string, position: number}}
+ */
+export function revealKey(providerName, selector) {
+  const config = loadConfig();
+  const { name, provider } = requireProvider(config, providerName);
+  const { entry, index } = requireKey(provider, selector);
+  return { provider: name, entry, key: entry.key, position: index + 1 };
 }
 
 /** Prints the pools grouped by provider. */

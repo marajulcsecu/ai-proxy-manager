@@ -26,7 +26,7 @@
 import fs from 'fs';
 import path from 'path';
 import { readXlsx } from './xlsx.js';
-import { normalizeConfig } from './configManager.js';
+import { normalizeConfig, normalizeProviderName } from './configManager.js';
 
 /**
  * Names in the inventory that cannot be matched to a provider id textually.
@@ -113,6 +113,46 @@ export function resolveProvider(hint, providers) {
   }
 
   return null;
+}
+
+/**
+ * Model names out of a "Top Models" cell.
+ *
+ * The real column is separated by commas and newlines at once
+ * ("gpt-5.6-sol,\nclaude-opus-4-8"), and sometimes by newlines alone. Anything
+ * with a space in it is prose, not a model id — the sheet also holds notes like
+ * "surprise me" in that column, and a made-up model name in a provider's list
+ * would come back as a 404 from the relay much later, far from here.
+ * @returns {Array<string>}
+ */
+function splitModels(text) {
+  const out = [];
+  for (const piece of String(text ?? '').split(/[,;\r\n]+/)) {
+    const name = piece.trim();
+    if (!name || name.length > 80) continue;
+    if (/\s/.test(name)) continue;
+    if (RE_KEY.test(name) || RE_URL.test(name) || RE_NUMBER.test(name) || RE_EMAIL.test(name)) continue;
+    if (!/[A-Za-z]/.test(name)) continue;
+    // Every model id in the inventory carries a version or a hyphen
+    // (claude-opus-5, gpt-5.6-sol, ox-alpha). A bare word does not, and one row
+    // writes the note "ALL KINDS OF MODELS" one word per line — four ids that
+    // would reach the dashboard's model list and 404 from the relay much later.
+    if (!/[\d\-/.:]/.test(name)) continue;
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Index of the models column, or -1.
+ *
+ * Named by its header rather than found by content: a model id looks like an
+ * ordinary hyphenated word, so content detection would happily read a provider
+ * name or a note as a model. If the sheet does not label the column, this
+ * reports nothing instead of guessing.
+ */
+function modelsColumn(header) {
+  return (header || []).findIndex(value => /model/i.test(cell(value)));
 }
 
 /** First cell holding an e-mail address. */
@@ -227,6 +267,7 @@ export function extractKeyRecords(sheets, options = {}) {
     const header = headerAt >= 0 ? rows[headerAt] : [];
     const body = rows.slice(headerAt + 1);
     const columns = providerColumns(header, body, providers);
+    const modelsAt = modelsColumn(header);
     // Row-per-provider tabs name the account once, in the header (or, when the
     // header was overwritten, in the tab name itself).
     const sheetLabel = emailIn(header) || emailIn([sheet.name]);
@@ -249,12 +290,14 @@ export function extractKeyRecords(sheets, options = {}) {
             continue;
           }
           if (!column.provider) {
-            unresolved.push({ key: found[0], hint: column.header, sheet: sheet.name, row: at });
+            // A column header is a name and nothing more: no URL, so no provider
+            // can be proposed from it later. Carried through all the same.
+            unresolved.push({ key: found[0], hint: column.header, name: column.header, url: '', sheet: sheet.name, row: at });
             continue;
           }
           keep({
             provider: column.provider, key: found[0], label,
-            remaining: null, referralUrl: '', dashboardUrl: '', sheet: sheet.name, row: at
+            remaining: null, referralUrl: '', dashboardUrl: '', models: [], sheet: sheet.name, row: at
           });
         }
         return;
@@ -278,10 +321,11 @@ export function extractKeyRecords(sheets, options = {}) {
 
       const provider = resolveProvider({ name, url: dashboard || referral }, providers);
       const hint = [name, dashboard || referral].filter(Boolean).join(' ');
+      const models = modelsAt >= 0 ? splitModels(cells[modelsAt]) : [];
       for (const keyCell of keyCells) {
         const key = RE_KEY.exec(keyCell)[0];
         if (!provider) {
-          unresolved.push({ key, hint, sheet: sheet.name, row: at });
+          unresolved.push({ key, hint, name, url: dashboard || referral, sheet: sheet.name, row: at });
           continue;
         }
         keep({
@@ -290,6 +334,7 @@ export function extractKeyRecords(sheets, options = {}) {
           remaining: amount === undefined ? null : Number(amount),
           referralUrl: referral,
           dashboardUrl: dashboard,
+          models,
           sheet: sheet.name,
           row: at
         });
@@ -316,11 +361,21 @@ export function extractKeyRecords(sheets, options = {}) {
 export function mergeKeyRecords(config, records) {
   const next = JSON.parse(JSON.stringify(config || {}));
   next.providers = next.providers || {};
-  let added = 0, updated = 0, unchanged = 0, skipped = 0;
+  let added = 0, updated = 0, unchanged = 0, skipped = 0, modelsAdded = 0;
+  /** provider -> models the sheet named, in the order it named them. */
+  const wanted = new Map();
 
   for (const record of records || []) {
     const provider = next.providers[record.provider];
     if (!provider) { skipped++; continue; }
+
+    // The models belong to the row, not to the key, so they are collected even
+    // when the key itself turns out to be one the pool already had.
+    if (record.models?.length) {
+      const list = wanted.get(record.provider) || [];
+      for (const model of record.models) if (!list.includes(model)) list.push(model);
+      wanted.set(record.provider, list);
+    }
 
     provider.keys = Array.isArray(provider.keys) ? provider.keys : [];
     const existing = provider.keys.find(entry => entry.key === record.key);
@@ -352,8 +407,79 @@ export function mergeKeyRecords(config, records) {
     if (touched) updated++; else unchanged++;
   }
 
-  return { config: normalizeConfig(next), added, updated, unchanged, skipped };
+  // Appended, never replaced: the list may have been curated by hand, and
+  // `defaultModel` is the user's choice of what to send — not the sheet's.
+  for (const [name, models] of wanted) {
+    const provider = next.providers[name];
+    provider.models = Array.isArray(provider.models) ? provider.models : [];
+    for (const model of models) {
+      if (!provider.models.includes(model)) { provider.models.push(model); modelsAdded++; }
+    }
+  }
+
+  return { config: normalizeConfig(next), added, updated, unchanged, skipped, modelsAdded };
 }
+
+/**
+ * API base for a relay the sheet only gave a website for.
+ *
+ * The column is called "URL For API KEY" and holds a dashboard link
+ * (https://api.justwoker.icu/), not an endpoint. Every relay in this inventory
+ * is a New-API / One-API fork, and all of them serve the OpenAI-shaped API at
+ * `/v1` of the same origin, so that is what is proposed — the path is dropped,
+ * because a token page is not a base URL. A URL that already names a version
+ * keeps it.
+ * @returns {string} '' when the URL is unusable
+ */
+function apiBaseFor(url) {
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return '';
+    const version = /\/v\d+[a-z]*/i.exec(parsed.pathname);
+    return `${parsed.origin}${version ? version[0] : '/v1'}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Proposes providers for keys that resolved to none.
+ *
+ * Read-only and separate from the import on purpose: creating a provider is a
+ * decision (it puts a host in the config that the proxy will send keys to), so
+ * the importer only acts on this when explicitly asked. A name already in the
+ * config is never proposed — overwriting a live provider's URL would take its
+ * whole key pool with it.
+ *
+ * @param {Array<{key: string, name?: string, url?: string, hint?: string}>} unresolved
+ * @param {Object} [providers] - the configured providers, which are off limits
+ * @returns {{create: Array<{name: string, url: string, keys: Array<string>, from: string}>,
+ *            stillUnresolved: Array<Object>}}
+ */
+export function planProviders(unresolved, providers = {}) {
+  const create = new Map();
+  const stillUnresolved = [];
+
+  for (const item of unresolved || []) {
+    const url = apiBaseFor(item?.url);
+    const typed = squash(item?.name);
+    const label = hostLabel(item?.url);
+    const name = normalizeProviderName(
+      PROVIDER_ALIASES[typed] || PROVIDER_ALIASES[label] || label || typed
+    );
+
+    // No URL means no provider: the matrix layout names a relay in a column
+    // header and nowhere else, and inventing a host for a key is not a repair.
+    if (!url || !name || providers[name]) { stillUnresolved.push(item); continue; }
+
+    const plan = create.get(name) || { name, url, keys: [], from: item.hint || item.name || '' };
+    if (item.key && !plan.keys.includes(item.key)) plan.keys.push(item.key);
+    create.set(name, plan);
+  }
+
+  return { create: [...create.values()], stillUnresolved };
+}
+
 
 /**
  * Parses CSV, for anything exported straight out of a spreadsheet.

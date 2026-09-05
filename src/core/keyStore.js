@@ -329,7 +329,11 @@ function changed(previous, entry) {
   return previous.status !== entry.status
     || previous.label !== entry.label
     || previous.remaining !== entry.remaining
-    || previous.note !== entry.note;
+    || previous.note !== entry.note
+    // The URLs are half of what the spreadsheet held, so an edit to one has to
+    // reach the second copy too, or the vault is not a copy of the sheet.
+    || previous.dashboardUrl !== entry.dashboardUrl
+    || previous.referralUrl !== entry.referralUrl;
 }
 
 /**

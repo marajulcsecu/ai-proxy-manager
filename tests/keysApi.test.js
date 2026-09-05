@@ -100,6 +100,18 @@ test('GET /api/keys lists the pool without ever sending a key', async () => {
   }
 });
 
+test('the listing carries the note, so an editor can show what the pool already says', async () => {
+  seed();
+  const patched = await call(`/api/keys/gorouter/${ID_B}`, { method: 'PATCH', body: { note: 'trial account, tops up monthly' } });
+  assert.deepEqual(patched.data.changed, ['note'], 'the note was stored, so a missing one below is the listing');
+
+  const { data } = await call('/api/keys');
+  const entry = data.providers[0].keys.find(key => key.id === ID_B);
+  // A form that cannot read the note back offers an empty field, and saving
+  // that field wipes what was there — losing the one thing nothing else records.
+  assert.equal(entry.note, 'trial account, tops up monthly');
+});
+
 test('an out-of-credit key shows up as an alert on the pool and on the status poll', async () => {
   seed();
   noteUpstreamFailure({ provider: 'gorouter', keyId: ID_A, statusCode: 403, body: SPENT });

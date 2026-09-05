@@ -1,13 +1,13 @@
 # Key pool + rotation — implementation plan
 
-Status: **all seven phases done** (branch `feat/key-pool`, 263 tests green). Pool schema,
+Status: **all eight phases done** (branch `feat/key-pool`, 319 tests green). Pool schema,
 vault and backups; the .xlsx reader and importer; the classifier; live detection — the proxy
 reads the rejection body, marks the key, raises an alert and keeps serving until the user
 switches; `ai-proxy keys check --balance`, which puts a verdict and a balance on every key
 without spending anything; `ai-proxy keys rotation <name> auto`, which lets one provider
 switch account inside the request that found the account empty; and `ai-proxy keys export`
 plus the documentation. What is left is not implementation but decisions: importing the real
-261 keys into the live `config.json`, restarting the daemon onto the new code, and choosing
+269 keys into the live `config.json`, restarting the daemon onto the new code, and choosing
 which providers get `auto`.
 
 One item listed under phase 4 below is still deliberately left out:
@@ -297,6 +297,61 @@ worth keeping in mind:
   second location every time a key was marked — the vault already covers recovery, and it
   never contains a path the user forgot about.
 
+### Phase 8 — the pool as a database, not just a mechanism
+
+Phases 1–7 made the pool work. This phase made it *usable as the account inventory*, which was
+the original ask: the spreadsheet stops being where the data lives.
+
+Files: `src/controllers/keysController.js`, `src/core/keyStore.js`, `src/core/keyImport.js`,
+`src/core/apiRoutes.js`, `src/cli.js`, `src/dashboard/{index.html,app.js,style.css}`.
+
+**Shipped as** three things:
+
+*(a) Manual add / edit / delete.* `keys add|edit|remove|reveal` on the CLI,
+`POST /api/keys/:name`, `PATCH /api/keys/:name/:id`, `DELETE /api/keys/:name/:id?confirm=1`
+and `GET /api/keys/:name/:id/value` on the API.
+
+*(b) The models column and `--create-providers`* on `keys import`.
+
+*(c) The dashboard **Keys** view*: every account, per provider, in spend order.
+
+Seven properties are worth keeping in mind:
+
+- **The editable set is defined by who can know the answer.** `label`, `note`, `dashboardUrl`
+  and `referralUrl` are things only a person knows. `status` follows what a relay answered,
+  `remaining` is measured by `keys check`, `requestsServed` and `lastUsedAt` are counted by the
+  proxy — asking to set one of those is a `400` naming the verb that owns it, rather than a
+  field the UI quietly ignores. The CLI's `keys edit` offers all four; the dashboard's form
+  offers the account and the note, the two the Keys view shows — the links stay as the import
+  left them, since a `PATCH` that does not name a field leaves it alone.
+- **A key value cannot be edited at all**, because the id is derived from it: changing the
+  value would either orphan every reference to the id or silently repoint one. Add the new key
+  and remove the old entry — two visible operations instead of one invisible one.
+- **A duplicate inside a provider is refused; the same key under another provider is
+  reported.** The first would be two rows with two independent ideas of one balance. The second
+  is a real situation — one relay's key pasted under a second name — and `alsoIn` says so,
+  because those entries will empty together and the second one will look mysterious.
+- **Nothing-changed writes nothing.** `editKey` returns `changed: []` and does not save. Every
+  save rotates a real backup off the end of the five, so a no-op save costs recoverability.
+- **Deleting says it twice, retiring says it once.** `--yes` / `confirm=1` / a confirm dialog
+  for delete; nothing for retire. Retire keeps the entry, its label and its measured balance,
+  and is almost always what was actually wanted. Even a delete leaves the value in
+  `keys.jsonl`.
+- **The models import distrusts its own column.** The header locates it (a model id looks like
+  any hyphenated word, so content detection would read a provider name as a model), and then a
+  filter drops anything with a space or without a digit or hyphen — one row writes "ALL KINDS
+  OF MODELS" one word per line, and an invented model surfaces as a 404 from the relay long
+  after the import that made it up. Models are added, never pruned.
+- **The Keys view addresses keys by id and renders them in pool order.** Rows are rebuilt from
+  a 2-second poll, so a mutation carrying a row number would retire whichever key had moved
+  into that position; and because the pool drains sequentially, a row's position *is* the
+  information — the key in use is marked where it stands rather than lifted to the top. The
+  view polls only while it is open, since `/api/keys` is one row per account.
+
+One thing deliberately left on the CLI: `import`, `check` and `export`. The first two run for
+minutes across hundreds of keys and want streaming progress, which a polling UI cannot show;
+the third writes a plaintext file to a path the user chooses.
+
 ---
 
 ## 4. Risks
@@ -306,5 +361,5 @@ worth keeping in mind:
 | Classifier retires a healthy key | Tier C deny-list; manual default; every decision logged with `matched` |
 | Balance probe accidentally spends credit | Abort on first byte; opt-in flag; concurrency cap |
 | Schema change loses existing keys | Migration test from a legacy config; append-only vault; backups |
-| 261 keys make the dashboard unusable | Group by provider, collapse exhausted, search by label |
+| 269 keys make the dashboard unusable | Done in phase 8: grouped by provider, 25 rows a page with *Show all*, filters for provider and status, search over account/note/masked key |
 | Keys leak into logs or git | Masking at the API boundary; `.gitignore`; `npm run verify` runs `check-secrets.sh` |

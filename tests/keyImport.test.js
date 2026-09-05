@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { extractKeyRecords, mergeKeyRecords, parseCsv, PROVIDER_ALIASES } =
+const { extractKeyRecords, mergeKeyRecords, parseCsv, planProviders, PROVIDER_ALIASES } =
   await import('../src/core/keyImport.js');
 const { normalizeConfig } = await import('../src/core/configManager.js');
 
@@ -50,6 +50,7 @@ test('a row-per-provider tab yields one record per key', () => {
       remaining: 55.34,
       referralUrl: 'https://gorouter.app/sign-up?aff=jN2p',
       dashboardUrl: 'https://gorouter.app/',
+      models: ['claude-opus-5'],
       sheet: undefined,
       row: undefined
     }
@@ -259,13 +260,6 @@ test('a csv exported from the inventory imports like the xlsx tab', () => {
   assert.equal(records[0].remaining, 55.34);
 });
 
-// --- nothing may be dropped in silence ---------------------------------------
-//
-// The first version of this importer lost 70 of 272 real keys: two tabs name
-// their columns with bare provider names and no "API Key" wording, so no header
-// was found, the tab was read as one-provider-per-row, and every row kept only
-// its first key. Silently. These tests exist so that cannot recur.
-
 /** The layout of "Temporary mails github 2": no "API Key" text anywhere. */
 const BARE_MATRIX = [{
   name: 'Temporary mails github 2',
@@ -274,6 +268,179 @@ const BARE_MATRIX = [{
     ['first@example.com', KEY_A, KEY_B, KEY_C, '']
   ]
 }];
+
+// --- the models column -------------------------------------------------------
+//
+// "Top Models" is the one column in the sheet that is not about a key at all: it
+// is the list of models that account can actually reach. Every string below is
+// verbatim from the real workbook, newlines included — the column is separated
+// by commas *and* newlines, and sometimes by newlines alone.
+
+test('the models column becomes a list on the record', () => {
+  const { records } = extractKeyRecords(inventoryTab([
+    ['Aegnt Router', 'https://agentrouter.org/', KEY_A, '', '', '', 'gpt-5.6-sol,\nclaude-opus-4-8,\nclaude-opus-5']
+  ]), { providers: PROVIDERS });
+
+  assert.deepEqual(records[0].models, ['gpt-5.6-sol', 'claude-opus-4-8', 'claude-opus-5']);
+});
+
+test('a models cell separated by newlines alone still splits', () => {
+  const { records } = extractKeyRecords(inventoryTab([
+    ['seekai', 'https://seekai.cc/', KEY_A, '', '', '', 'claude-fable-5\nclaude-opus-5']
+  ]), { providers: PROVIDERS });
+
+  assert.deepEqual(records[0].models, ['claude-fable-5', 'claude-opus-5']);
+});
+
+test('prose in the models column is dropped rather than filed as a model', () => {
+  const { records } = extractKeyRecords(inventoryTab([
+    ['GoRouter', 'https://gorouter.app/', KEY_A, '', '', '', 'claude-opus-5, surprise me, 4.5']
+  ]), { providers: PROVIDERS });
+
+  assert.deepEqual(records[0].models, ['claude-opus-5'], 'a model id has no spaces and is not a number');
+});
+
+test('a note written one word per line is not four models', () => {
+  // Verbatim from the anymodel row: "ALL\nKINDS \nOF \nMODELS". Each word is a
+  // line of its own, so splitting alone accepts all four. A model id carries a
+  // version — a bare word does not — and four invented ids would reach the
+  // dashboard's model list and 404 from the relay much later.
+  const { records } = extractKeyRecords(inventoryTab([
+    ['anymodel', 'https://anymodel.org/', KEY_A, '', '', '', 'ALL\nKINDS \nOF \nMODELS']
+  ]), { providers: { ...PROVIDERS, anymodel: { url: 'https://anymodel.org/v1' } } });
+
+  assert.deepEqual(records[0].models, []);
+});
+
+test('a tab with no models column yields no models, rather than guessing at a cell', () => {
+  const { records } = extractKeyRecords(inventoryTab([
+    ['GoRouter', 'https://gorouter.app/', KEY_A, '', '', '55.34']
+  ], ['a@example.com', 'API Provider: ', 'API Key:', 'URL For API KEY', 'Referel Link: ', 'Remaining Credit']), { providers: PROVIDERS });
+
+  assert.deepEqual(records[0].models, []);
+});
+
+test('the matrix layout carries no models, and says so with an empty list', () => {
+  const { records } = extractKeyRecords(BARE_MATRIX, { providers: PROVIDERS });
+  assert.deepEqual(records.map(r => r.models), [[], [], []]);
+});
+
+test('imported models are added to the provider without disturbing its own list', () => {
+  const config = normalizeConfig({
+    providers: {
+      gorouter: { url: 'https://gorouter.app/v1', defaultModel: 'claude-opus-5', models: ['claude-opus-5'], keys: [] }
+    }
+  });
+
+  const { config: after, modelsAdded } = mergeKeyRecords(config, [{
+    provider: 'gorouter', key: KEY_B, label: '', remaining: null, referralUrl: '', dashboardUrl: '',
+    models: ['claude-opus-5', 'claude-opus-4-8-thinking']
+  }]);
+
+  assert.equal(modelsAdded, 1, 'a model already listed is not added twice');
+  assert.deepEqual(after.providers.gorouter.models, ['claude-opus-5', 'claude-opus-4-8-thinking']);
+  assert.equal(after.providers.gorouter.defaultModel, 'claude-opus-5', 'which model to send is the user\'s choice, not the sheet\'s');
+});
+
+test('models arrive even when the key itself was already known', () => {
+  // The models belong to the row, not to the key, so a re-import that changes
+  // no key at all can still teach the provider a model it did not have.
+  const { config, added, unchanged, modelsAdded } = mergeKeyRecords(baseConfig(), [{
+    provider: 'gorouter', key: KEY_A, label: '', remaining: null, referralUrl: '', dashboardUrl: '',
+    models: ['claude-opus-5']
+  }]);
+
+  assert.equal(added, 0);
+  assert.equal(unchanged, 1);
+  assert.equal(modelsAdded, 1);
+  assert.deepEqual(config.providers.gorouter.models, ['claude-opus-5']);
+});
+
+test('models for a provider that is not configured are not filed under another', () => {
+  const { config, skipped, modelsAdded } = mergeKeyRecords(baseConfig(), [{
+    provider: 'justwoker', key: KEY_C, label: '', remaining: null, referralUrl: '', dashboardUrl: '',
+    models: ['claude-opus-5']
+  }]);
+
+  assert.equal(skipped, 1);
+  assert.equal(modelsAdded, 0);
+  for (const provider of Object.values(config.providers)) assert.deepEqual(provider.models, []);
+});
+
+// --- planning a provider the config has never heard of ------------------------
+//
+// Four real keys sat in the "unresolved" pile for one reason: the sheet knows a
+// relay the proxy does not. The sheet also holds its URL, so the provider can be
+// proposed rather than typed by hand — but only when asked, and never over one
+// that already exists.
+
+test('an unresolved row is planned as a provider named after its host', () => {
+  const { unresolved } = extractKeyRecords(inventoryTab([
+    ['Just Do work', 'https://api.justwoker.icu/', KEY_A]
+  ]), { providers: PROVIDERS });
+
+  const { create, stillUnresolved } = planProviders(unresolved, PROVIDERS);
+
+  assert.deepEqual(stillUnresolved, []);
+  assert.equal(create.length, 1);
+  assert.equal(create[0].name, 'justwoker', 'the alias table already knew "Just Do work" is justwoker');
+  assert.equal(create[0].url, 'https://api.justwoker.icu/v1', 'the sheet holds the dashboard, the API base is /v1 of it');
+  assert.deepEqual(create[0].keys, [KEY_A]);
+});
+
+test('several rows for the same new provider plan it once, with every key', () => {
+  const { unresolved } = extractKeyRecords([
+    ...inventoryTab([['Just Do work', 'https://api.justwoker.icu/', KEY_A]]),
+    ...inventoryTab([['Just Do work', 'https://api.justwoker.icu/', KEY_B]])
+  ], { providers: PROVIDERS });
+
+  const { create } = planProviders(unresolved, PROVIDERS);
+  assert.equal(create.length, 1);
+  assert.deepEqual(create[0].keys, [KEY_A, KEY_B]);
+});
+
+test('a URL that already names a version keeps it instead of gaining a second', () => {
+  const { unresolved } = extractKeyRecords(inventoryTab([
+    ['New Relay', 'https://relay.example.com/v1/', KEY_A]
+  ]), { providers: PROVIDERS });
+
+  assert.equal(planProviders(unresolved, PROVIDERS).create[0].url, 'https://relay.example.com/v1');
+});
+
+test('an unresolved key with no URL cannot be planned, and stays unresolved', () => {
+  // The matrix layout names the provider in a column header and nowhere else,
+  // so there is nothing to point a new provider at. Guessing a URL would send
+  // the key to a host the user never mentioned.
+  const { unresolved } = extractKeyRecords([{
+    name: 'T',
+    rows: [['mail', 'GoRouter', 'Some New Relay'], ['a@example.com', KEY_A, KEY_B]]
+  }], { providers: PROVIDERS });
+
+  const { create, stillUnresolved } = planProviders(unresolved, PROVIDERS);
+
+  assert.deepEqual(create, []);
+  assert.deepEqual(stillUnresolved.map(u => u.key), [KEY_B]);
+});
+
+test('a plan never proposes a name that is already configured', () => {
+  // Defensive: creating one would overwrite a live provider's URL and its whole
+  // pool. The extractor should have resolved this row, so reaching here at all
+  // means something is wrong — and the safe answer is to leave it unresolved.
+  const { create, stillUnresolved } = planProviders(
+    [{ key: KEY_A, name: 'GoRouter', url: 'https://gorouter.app/', hint: 'GoRouter' }],
+    PROVIDERS
+  );
+
+  assert.deepEqual(create, []);
+  assert.equal(stillUnresolved.length, 1);
+});
+
+// --- nothing may be dropped in silence ---------------------------------------
+//
+// The first version of this importer lost 70 of 272 real keys: two tabs name
+// their columns with bare provider names and no "API Key" wording, so no header
+// was found, the tab was read as one-provider-per-row, and every row kept only
+// its first key. Silently. These tests exist so that cannot recur.
 
 test('a matrix tab whose header is just provider names is still a matrix', () => {
   const { records, unresolved } = extractKeyRecords(BARE_MATRIX, { providers: PROVIDERS });

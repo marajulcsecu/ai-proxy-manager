@@ -72,9 +72,16 @@ const state = {
   tests: new Map(),
   /** provider name -> revealed key */
   revealed: new Map(),
+  /** one pool view per provider, from /api/keys */
+  keys: [],
+  /** "provider:keyId" -> revealed key value */
+  revealedKeys: new Map(),
+  /** providers whose pool is shown in full rather than the first page */
+  keysExpanded: new Set(),
   view: 'overview',
   online: false,
   logFilter: { provider: '', status: '' },
+  keyFilter: { provider: '', status: '', search: '' },
   autoRefreshLogs: true,
   rendered: {}
 };
@@ -174,6 +181,9 @@ function setView(view) {
     else item.removeAttribute('aria-current');
   }
   if (location.hash !== `#${view}`) history.replaceState(null, '', `#${view}`);
+  // The pools are not polled while the view is closed, so they are fetched on
+  // arrival rather than shown as they were when the tab was last open.
+  if (view === 'keys') refreshKeys();
   renderAll();
 }
 
@@ -185,7 +195,7 @@ function initRouter() {
     button.addEventListener('click', () => setView(button.dataset.goto));
   }
   const initial = location.hash.replace('#', '');
-  setView(['overview', 'providers', 'requests', 'setup', 'settings'].includes(initial) ? initial : 'overview');
+  setView(['overview', 'providers', 'keys', 'requests', 'setup', 'settings'].includes(initial) ? initial : 'overview');
 }
 
 // ========================================================== overlay manager
@@ -327,6 +337,19 @@ async function refreshLogs() {
   renderOverview();
 }
 
+/**
+ * The whole inventory: every provider's pool in one call. Only polled while the
+ * Keys view is open — it is the largest response the API serves (one row per
+ * account) and nothing outside that view reads it.
+ */
+async function refreshKeys() {
+  const data = await api('/api/keys', { quiet: true });
+  if (!data || !data.providers) return;
+  state.keys = data.providers;
+  renderKeyFilterOptions();
+  renderKeys();
+}
+
 let themeSyncedFromServer = false;
 
 async function refreshSettings() {
@@ -364,6 +387,7 @@ function renderAll() {
   renderKeyAlerts();
   renderOverview();
   renderProviders();
+  renderKeys();
   renderLogs();
   renderSetup();
   renderSettings();
@@ -375,6 +399,7 @@ function startPolling() {
     if (document.hidden) return;
     refreshStatus();
     refreshProviders();
+    if (state.view === 'keys') refreshKeys();
     if (state.autoRefreshLogs) refreshLogs();
   }, POLL_MS);
 
@@ -749,6 +774,10 @@ function renderProviders() {
   $('#providers-count-label').textContent = state.providers.length
     ? `All providers (${state.providers.length})`
     : 'All providers';
+  // Counted from the provider list rather than from the pools: those are only
+  // fetched while the Keys view is open, and the badge has to be right before then.
+  const keyTotal = state.providers.reduce((sum, provider) => sum + (provider.keyCount || 0), 0);
+  $('#nav-key-count').textContent = keyTotal || '';
 
   grid.innerHTML = state.providers.length
     ? state.providers.map(providerCardHtml).join('')
@@ -760,6 +789,447 @@ function renderProviders() {
        </div>`;
 
   if (focusKey) grid.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`)?.focus();
+}
+
+// ===================================================================== keys
+
+/**
+ * Rows drawn per provider before the rest have to be asked for. A hundred
+ * accounts under one relay is normal here, and every row carries five buttons.
+ */
+const KEY_PAGE = 25;
+
+/** What each filter option covers, in pool statuses. */
+const KEY_STATUS_GROUPS = {
+  usable: ['active', 'unknown'],
+  active: ['active'],
+  unknown: ['unknown'],
+  exhausted: ['exhausted'],
+  dead: ['invalid', 'disabled']
+};
+
+/** One word per status. `unknown` is not a problem, so it is not read as one. */
+const KEY_STATUS_TEXT = {
+  active: 'active',
+  unknown: 'untested',
+  exhausted: 'spent',
+  invalid: 'revoked',
+  disabled: 'disabled'
+};
+
+/** True when a key passes the status filter and the search box. */
+function keyMatches(key) {
+  const group = KEY_STATUS_GROUPS[state.keyFilter.status];
+  if (group && !group.includes(key.status)) return false;
+
+  const needle = state.keyFilter.search.trim().toLowerCase();
+  if (!needle) return true;
+  return [key.label, key.masked, key.note, KEY_STATUS_TEXT[key.status] || key.status]
+    .some(field => String(field ?? '').toLowerCase().includes(needle));
+}
+
+/** The pool of one provider, or null. */
+const keyPoolFor = name => state.keys.find(pool => pool.name === name) ?? null;
+
+/** One key out of a pool, by id. */
+function keyEntryFor(name, keyId) {
+  return keyPoolFor(name)?.keys.find(key => key.id === keyId) ?? null;
+}
+
+/**
+ * One row: which account, which key, and what can be done to it.
+ *
+ * Every button carries the key id, never the row number: the table is redrawn
+ * from a 2s poll, so a position that shifted between the click and the request
+ * would retire whichever key had moved into it.
+ */
+function keyRowHtml(name, key) {
+  const shown = state.revealedKeys.get(`${name}:${key.id}`);
+  const focus = what => `${what}:${name}:${key.id}`;
+  const usable = key.status === 'active' || key.status === 'unknown';
+
+  const keyCell = shown
+    ? `<span class="key-shown">${esc(shown)}</span>
+       <button class="key-reveal" data-action="key-hide" data-name="${attr(name)}" data-key-id="${attr(key.id)}"
+               data-focus-key="${attr(focus('key-hide'))}">hide</button>`
+    : `<span>${esc(key.masked)}</span>
+       <button class="key-reveal" data-action="key-reveal" data-name="${attr(name)}" data-key-id="${attr(key.id)}"
+               data-focus-key="${attr(focus('key-reveal'))}">reveal</button>`;
+
+  // Retire is offered for a key that still counts as usable, revive for one
+  // that does not: the two are the same switch read from either side.
+  const actions = [
+    key.inUse || !usable ? '' : `<button class="key-reveal" data-action="key-use" data-name="${attr(name)}"
+        data-key-id="${attr(key.id)}" data-focus-key="${attr(focus('key-use'))}"
+        title="Send this key from now on">use</button>`,
+    usable ? `<button class="key-reveal" data-action="key-retire-one" data-name="${attr(name)}"
+        data-key-id="${attr(key.id)}" data-focus-key="${attr(focus('key-retire-one'))}"
+        title="Mark it spent and stop sending it">retire</button>` : '',
+    usable ? '' : `<button class="key-reveal" data-action="key-revive" data-name="${attr(name)}"
+        data-key-id="${attr(key.id)}" data-focus-key="${attr(focus('key-revive'))}"
+        title="Put it back in the pool as untested — after a top-up">revive</button>`,
+    `<button class="key-reveal" data-action="key-edit" data-name="${attr(name)}"
+        data-key-id="${attr(key.id)}" data-focus-key="${attr(focus('key-edit'))}"
+        title="Correct the account or the note">edit</button>`,
+    `<button class="key-reveal is-danger" data-action="key-delete" data-name="${attr(name)}"
+        data-key-id="${attr(key.id)}" data-focus-key="${attr(focus('key-delete'))}"
+        title="Remove it from the pool">delete</button>`
+  ].filter(Boolean).join('');
+
+  return `
+    <tr class="${key.inUse ? 'is-inuse' : ''}">
+      <td><span class="key-status is-${attr(key.status)}">${esc(KEY_STATUS_TEXT[key.status] || key.status)}</span>
+        ${key.inUse ? '<span class="key-inuse-mark" title="This is the key being sent">in use</span>' : ''}</td>
+      <td class="key-account">
+        ${key.label ? `<span>${esc(key.label)}</span>` : '<span class="dim">no account recorded</span>'}
+        ${key.note ? `<span class="dim">${esc(key.note)}</span>` : ''}
+      </td>
+      <td class="mono key-cell">${keyCell}</td>
+      <td class="key-row-actions">${actions}</td>
+    </tr>`;
+}
+
+/**
+ * One provider's pool: the header says who is paying and who decides when to
+ * switch, the table says what is left.
+ * @param {Object} pool - an entry of /api/keys `providers`
+ * @returns {string}
+ */
+function keyGroupHtml(pool) {
+  const name = pool.name;
+  const matching = pool.keys.filter(keyMatches);
+  const expanded = state.keysExpanded.has(name);
+  const rows = expanded ? matching : matching.slice(0, KEY_PAGE);
+  const inUse = pool.keys.find(key => key.inUse);
+  const auto = pool.rotation === 'auto';
+
+  const counts = [
+    `${pool.total} key${pool.total === 1 ? '' : 's'}`,
+    pool.spent ? `${pool.spent} spent` : '',
+    pool.unusable ? `${pool.unusable} dead` : ''
+  ].filter(Boolean).join(' · ');
+
+  const head = `
+    <div class="keys-group-head">
+      <h2>${esc(name)}</h2>
+      <span class="key-pool-count muted">${esc(counts)}</span>
+      ${inUse
+        ? `<span class="muted">sending <strong>${esc(inUse.label || inUse.masked)}</strong>${
+            typeof inUse.remaining === 'number' ? ` · ${esc(formatCredit(inUse.remaining))} left` : ''}</span>`
+        : '<span class="muted">nothing selected — the next request has no key to send</span>'}
+      <div class="topbar-spacer"></div>
+      <button class="key-reveal" data-action="key-rotation" data-name="${attr(name)}"
+              data-mode="${attr(auto ? 'manual' : 'auto')}" data-focus-key="key-rotation:${attr(name)}"
+              title="${attr(auto
+                ? 'Stop switching by itself: raise the banner and keep sending the same key'
+                : 'Switch to the next account by itself when this one is refused for want of credit')}">
+        ${auto ? 'auto ✓' : 'auto'}
+      </button>
+      <button class="key-reveal" data-action="key-next" data-name="${attr(name)}"
+              data-focus-key="key-next:${attr(name)}" title="Switch to the next usable key">next key</button>
+      <button class="key-reveal" data-action="key-add" data-name="${attr(name)}"
+              data-focus-key="key-add:${attr(name)}">+ add key</button>
+    </div>`;
+
+  if (!pool.total) {
+    return `<section class="keys-group">${head}
+      <div class="empty">
+        <span class="empty-icon" aria-hidden="true">⚿</span>
+        <strong>No keys yet</strong>
+        <span>Add one by hand, or import the spreadsheet: <code>ai-proxy keys import &lt;file.xlsx&gt;</code></span>
+      </div></section>`;
+  }
+
+  if (!matching.length) {
+    return `<section class="keys-group">${head}
+      <div class="empty"><span>None of ${pool.total} keys here match that filter.</span></div></section>`;
+  }
+
+  // "Show all" rather than paging: the order is the order they will be spent,
+  // so a page number would be a worse way to find the end of the queue.
+  const more = matching.length > rows.length || (expanded && matching.length > KEY_PAGE)
+    ? `<div class="keys-more">
+         <button class="btn btn-sm" data-action="key-expand" data-name="${attr(name)}"
+                 data-focus-key="key-expand:${attr(name)}">
+           ${expanded ? `Show first ${KEY_PAGE}` : `Show all ${matching.length}`}
+         </button>
+         <span class="dim">showing ${rows.length} of ${matching.length}${
+           matching.length === pool.total ? '' : ` (${pool.total} in the pool)`}</span>
+       </div>`
+    : '';
+
+  return `
+    <section class="keys-group">
+      ${head}
+      <div class="table-wrap">
+        <table class="key-table">
+          <thead>
+            <tr>
+              <th>Status</th><th>Account</th><th>Key</th><th></th>
+            </tr>
+          </thead>
+          <tbody>${rows.map(key => keyRowHtml(name, key)).join('')}</tbody>
+        </table>
+      </div>
+      ${more}
+    </section>`;
+}
+
+/** Provider options for the Keys toolbar, kept in step with the pools. */
+function renderKeyFilterOptions() {
+  const select = $('#key-filter-provider');
+  const names = state.keys.map(pool => pool.name);
+  if (state.rendered.keyFilterOptions === signature(names)) return;
+  state.rendered.keyFilterOptions = signature(names);
+
+  const current = select.value;
+  select.innerHTML = `<option value="">All providers</option>${
+    names.map(name => `<option value="${attr(name)}">${esc(name)}</option>`).join('')}`;
+  if (names.includes(current)) select.value = current;
+}
+
+/**
+ * The Keys view. Redrawn from the same 2s poll as everything else, so it is
+ * skipped whenever its input has not changed and whenever a dialog is open —
+ * a redraw underneath the add/edit form would throw away what was being typed.
+ */
+function renderKeys() {
+  const host = $('#keys-area');
+  const pools = state.keyFilter.provider
+    ? state.keys.filter(pool => pool.name === state.keyFilter.provider)
+    : state.keys;
+
+  const view = {
+    pools,
+    filter: state.keyFilter,
+    revealed: Array.from(state.revealedKeys.keys()),
+    expanded: Array.from(state.keysExpanded)
+  };
+  if (state.rendered.keys === signature(view)) return;
+  if (anyOverlayOpen()) return;
+  state.rendered.keys = signature(view);
+
+  const focusKey = document.activeElement?.dataset?.focusKey;
+
+  const total = state.keys.reduce((sum, pool) => sum + pool.total, 0);
+  const spent = state.keys.reduce((sum, pool) => sum + pool.spent, 0);
+  const dead = state.keys.reduce((sum, pool) => sum + pool.unusable, 0);
+  $('#keys-summary').textContent = total
+    ? `${total} key${total === 1 ? '' : 's'} · ${total - spent - dead} usable · ${spent} spent${dead ? ` · ${dead} dead` : ''}`
+    : '';
+
+  host.innerHTML = state.keys.length
+    ? (pools.length ? pools.map(keyGroupHtml).join('') : '<div class="empty"><span>No such provider.</span></div>')
+    : `<div class="empty">
+         <span class="empty-icon" aria-hidden="true">⚿</span>
+         <strong>No providers yet</strong>
+         <span>Keys belong to a provider — add one first, then its accounts.</span>
+         <button class="btn btn-primary btn-sm" data-goto="providers">Go to Providers</button>
+       </div>`;
+
+  for (const button of host.querySelectorAll('[data-goto]')) {
+    button.addEventListener('click', () => setView(button.dataset.goto));
+  }
+  if (focusKey) host.querySelector(`[data-focus-key="${CSS.escape(focusKey)}"]`)?.focus();
+}
+
+// ========================================================== key operations
+
+/** Everything a pool change can be seen in: the table, the cards, the banner. */
+function afterKeyChange() {
+  state.rendered.keys = null;
+  state.rendered.keyAlerts = null;
+  state.rendered.providers = null;
+  refreshKeys();
+  refreshProviders();
+  refreshStatus();
+}
+
+/** A failed pool call, reported with the hint the API attached to it. */
+function keyFailed(data, fallback) {
+  toast([data?.error, data?.hint].filter(Boolean).join(' — ') || fallback, 'error');
+}
+
+/** Pins one key by id — "send this account from now on". */
+async function useKeyById(name, keyId) {
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/use`, { method: 'POST', body: { keyId } });
+  if (!data?.ok) return keyFailed(data, 'Could not switch to that key');
+  toast(`${name} is now using ${data.to?.label || data.to?.masked || 'that key'}`, 'ok');
+  afterKeyChange();
+}
+
+/**
+ * Marks one key spent. Asked for by hand here — the proxy marks a key itself
+ * when a relay refuses it, so this is for a balance the user saw before it did.
+ */
+async function retireKeyById(name, keyId) {
+  const entry = keyEntryFor(name, keyId);
+  const confirmed = await confirmDialog({
+    title: `Retire ${entry?.label || entry?.masked || 'this key'}?`,
+    message: 'It stays in the pool, marked spent, and stops being sent. If it is the key in use, '
+      + 'the next usable one takes over. Revive it after a top-up.',
+    confirmLabel: 'Retire'
+  });
+  if (!confirmed) return;
+
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/retire`, { method: 'POST', body: { keyId } });
+  if (!data?.ok) return keyFailed(data, 'Could not retire that key');
+  toast(`${name}: ${data.from?.label || 'that key'} retired${
+    data.to ? `, now using ${data.to.label || data.to.masked}` : ''}`, 'ok');
+  afterKeyChange();
+}
+
+/** Puts a topped-up account back in the pool, as untested rather than as good. */
+async function reviveKeyById(name, keyId) {
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/revive`, { method: 'POST', body: { keyId } });
+  if (!data?.ok) return keyFailed(data, 'Could not revive that key');
+  toast(`${data.entry?.label || 'that key'} is back in ${name}'s pool, untested`, 'ok');
+  afterKeyChange();
+}
+
+/** Reads one key back in full. The only call that returns a key value. */
+async function revealPoolKey(name, keyId) {
+  const data = await api(`/api/keys/${encodeURIComponent(name)}/${encodeURIComponent(keyId)}/value`);
+  if (!data?.ok) return keyFailed(data, 'Could not read that key');
+  state.revealedKeys.set(`${name}:${keyId}`, data.apiKey || '(empty)');
+  state.rendered.keys = null;
+  renderKeys();
+}
+
+/**
+ * Drops a key from the pool. Distinct from retiring it, and asked twice as
+ * plainly: the value stays only in keys.jsonl afterwards.
+ */
+async function deletePoolKey(name, keyId) {
+  const entry = keyEntryFor(name, keyId);
+  const confirmed = await confirmDialog({
+    title: `Delete ${entry?.label || entry?.masked || 'this key'} from ${name}?`,
+    message: 'It leaves the pool entirely. The value stays in keys.jsonl, so it can be recovered by hand, '
+      + 'but nothing in the dashboard will show it again. To keep it and stop sending it, retire it instead.',
+    confirmLabel: 'Delete key'
+  });
+  if (!confirmed) return;
+
+  const data = await api(
+    `/api/keys/${encodeURIComponent(name)}/${encodeURIComponent(keyId)}?confirm=1`,
+    { method: 'DELETE' }
+  );
+  if (!data?.ok) return keyFailed(data, 'Could not delete that key');
+  state.revealedKeys.delete(`${name}:${keyId}`);
+  toast(`${data.entry?.label || 'That key'} removed from ${name}${
+    data.movedTo ? ` — now using ${data.movedTo.label || data.movedTo.masked}` : ''}`, 'ok');
+  afterKeyChange();
+}
+
+// ============================================================== key dialog
+
+/** What the open key dialog is pointed at. Empty keyId means "adding". */
+let keyDialogTarget = { provider: '', keyId: '' };
+
+/**
+ * The add / edit form.
+ *
+ * Editing offers strictly less than adding, and deliberately: a key value
+ * cannot be corrected in place (the id is derived from it, so a new value is a
+ * new entry), a status follows what happened rather than what was typed, and a
+ * balance is measured by `keys check`. The fields that do appear are the ones
+ * nothing else in the tool can find out on its own.
+ *
+ * @param {string} name - provider to add to / edit in
+ * @param {string} [keyId] - key to edit, or empty to add
+ */
+function openKeyDialog(name = '', keyId = '') {
+  const editing = Boolean(keyId);
+  const entry = editing ? keyEntryFor(name, keyId) : null;
+  if (editing && !entry) return toast('That key is no longer in the pool', 'error');
+  keyDialogTarget = { provider: name, keyId };
+
+  const names = state.keys.length
+    ? state.keys.map(pool => pool.name)
+    : state.providers.map(provider => provider.name);
+  const chosen = name || state.keyFilter.provider || state.status?.activeProvider || names[0] || '';
+
+  const select = $('#kf-provider');
+  select.innerHTML = names.map(item =>
+    `<option value="${attr(item)}" ${item === chosen ? 'selected' : ''}>${esc(item)}</option>`).join('');
+  select.disabled = editing;
+
+  $('#key-dialog-title').textContent = editing
+    ? `Edit ${entry.label || entry.masked}`
+    : 'Add key';
+  $('#kf-submit').textContent = editing ? 'Save changes' : 'Add key';
+  $('#kf-provider-hint').textContent = editing
+    ? 'A key value cannot be edited — add the new one and delete this entry.'
+    : 'The relay that bills this account. Keys are spent in order, top of the list first.';
+
+  // Hidden rather than disabled: a field that cannot be used here is noise, and
+  // the reason it is missing is written above, next to the provider.
+  $('#kf-key-field').hidden = editing;
+  $('#kf-remaining-field').hidden = editing;
+  $('#kf-use-row').hidden = editing;
+
+  $('#kf-key').value = '';
+  $('#kf-label').value = entry?.label ?? '';
+  $('#kf-note').value = entry?.note ?? '';
+  $('#kf-remaining').value = '';
+  $('#kf-use').setAttribute('aria-checked', 'false');
+  $('#kf-error').hidden = true;
+
+  showOverlay('#key-overlay', editing ? '#kf-label' : '#kf-key');
+}
+
+async function submitKeyForm(event) {
+  event.preventDefault();
+  const { keyId } = keyDialogTarget;
+  const name = $('#kf-provider').value;
+  const fail = message => {
+    $('#kf-error').textContent = message;
+    $('#kf-error').hidden = false;
+  };
+  if (!name) return fail('Pick the provider this key belongs to.');
+
+  // Sent whole, empty strings included: an emptied field is how a note is
+  // cleared, so leaving it out would make that impossible. The dashboard and
+  // referral links are deliberately absent: a PATCH that does not name a field
+  // leaves it alone, so what the import found stays where it is.
+  const fields = {
+    label: $('#kf-label').value.trim(),
+    note: $('#kf-note').value.trim()
+  };
+
+  if (keyId) {
+    const data = await api(`/api/keys/${encodeURIComponent(name)}/${encodeURIComponent(keyId)}`,
+      { method: 'PATCH', body: fields });
+    if (!data?.ok) return fail([data?.error, data?.hint].filter(Boolean).join(' — ') || 'The request failed.');
+
+    hideOverlay($('#key-overlay'));
+    toast(data.changed?.length
+      ? `Updated ${data.entry?.label || 'that key'} (${data.changed.join(', ')})`
+      : 'Already said that — nothing written', data.changed?.length ? 'ok' : 'info');
+    afterKeyChange();
+    return;
+  }
+
+  const key = $('#kf-key').value.trim();
+  if (!key) return fail('Paste the key itself.');
+
+  const typed = $('#kf-remaining').value.trim();
+  const credit = Number(typed);
+  const body = { ...fields, key, use: $('#kf-use').getAttribute('aria-checked') === 'true' };
+  if (typed && Number.isFinite(credit)) body.remaining = credit;
+
+  const data = await api(`/api/keys/${encodeURIComponent(name)}`, { method: 'POST', body });
+  if (!data?.ok) return fail([data?.error, data?.hint].filter(Boolean).join(' — ') || 'The request failed.');
+
+  hideOverlay($('#key-overlay'));
+  toast(`Added ${data.entry?.label || data.entry?.masked || 'the key'} to ${name} as #${data.position}${
+    data.inUse ? ' — now in use' : ''}`, 'ok');
+  // The same value under two relays is legitimate but usually a mis-paste, and
+  // the API is the only thing that can see it.
+  if (data.alsoIn?.length) {
+    toast(`That same key is also in ${data.alsoIn.join(', ')} — check it went to the right provider.`, 'error');
+  }
+  afterKeyChange();
 }
 
 // ================================================================= requests
@@ -1318,10 +1788,12 @@ function buildPaletteItems() {
   const items = [
     { label: 'Go to Overview', kind: 'view', run: () => setView('overview') },
     { label: 'Go to Providers', kind: 'view', run: () => setView('providers') },
+    { label: 'Go to Keys', kind: 'view', run: () => setView('keys') },
     { label: 'Go to Requests', kind: 'view', run: () => setView('requests') },
     { label: 'Go to Setup', kind: 'view', run: () => setView('setup') },
     { label: 'Go to Settings', kind: 'view', run: () => setView('settings') },
     { label: 'Add a provider', kind: 'action', run: () => openProviderDialog(null) },
+    { label: 'Add a key', kind: 'action', run: () => openKeyDialog() },
     { label: 'Test all providers', kind: 'action', run: () => testAllProviders() },
     { label: 'Clear request history', kind: 'action', run: () => clearLogs() },
     { label: 'Toggle theme', kind: 'action', run: () => $('#theme-toggle').click() },
@@ -1502,6 +1974,25 @@ const ACTIONS = {
   'key-retire': target => retireKey(target.dataset.name),
   'key-dismiss': target => dismissKeyAlert(target.dataset.name, target.dataset.keyId),
   'key-rotation': target => setKeyRotation(target.dataset.name, target.dataset.mode),
+  'key-use': target => useKeyById(target.dataset.name, target.dataset.keyId),
+  'key-retire-one': target => retireKeyById(target.dataset.name, target.dataset.keyId),
+  'key-revive': target => reviveKeyById(target.dataset.name, target.dataset.keyId),
+  'key-delete': target => deletePoolKey(target.dataset.name, target.dataset.keyId),
+  'key-edit': target => openKeyDialog(target.dataset.name, target.dataset.keyId),
+  'key-add': target => openKeyDialog(target.dataset.name),
+  'key-reveal': target => revealPoolKey(target.dataset.name, target.dataset.keyId),
+  'key-hide': target => {
+    state.revealedKeys.delete(`${target.dataset.name}:${target.dataset.keyId}`);
+    state.rendered.keys = null;
+    renderKeys();
+  },
+  'key-expand': target => {
+    const name = target.dataset.name;
+    if (state.keysExpanded.has(name)) state.keysExpanded.delete(name);
+    else state.keysExpanded.add(name);
+    state.rendered.keys = null;
+    renderKeys();
+  },
   'form-remove-model': target => {
     formModels = formModels.filter(model => model !== target.dataset.model);
     renderFormModels();
@@ -1588,6 +2079,30 @@ function wireEvents() {
   $('#log-autorefresh').addEventListener('change', event => {
     state.autoRefreshLogs = event.target.checked;
     if (state.autoRefreshLogs) refreshLogs();
+  });
+
+  $('#add-key-btn').addEventListener('click', () => openKeyDialog());
+  $('#key-form').addEventListener('submit', submitKeyForm);
+  $('#kf-use').addEventListener('click', event => {
+    const on = event.currentTarget.getAttribute('aria-checked') === 'true';
+    event.currentTarget.setAttribute('aria-checked', String(!on));
+  });
+  $('#key-filter-provider').addEventListener('change', event => {
+    state.keyFilter.provider = event.target.value;
+    state.rendered.keys = null;
+    renderKeys();
+  });
+  $('#key-filter-status').addEventListener('change', event => {
+    state.keyFilter.status = event.target.value;
+    state.rendered.keys = null;
+    renderKeys();
+  });
+  // `input`, not `change`: filtering 269 rows is a string compare over data
+  // already in memory, so there is nothing to wait for between keystrokes.
+  $('#key-search').addEventListener('input', event => {
+    state.keyFilter.search = event.target.value;
+    state.rendered.keys = null;
+    renderKeys();
   });
 
   $('#export-redacted-btn').addEventListener('click', () => exportConfig(false));
